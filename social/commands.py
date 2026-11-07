@@ -50,7 +50,7 @@ class StockCommandMixin:
         matched_groups: Any = None,
         **kwargs: Any,
     ) -> Tuple[bool, str, bool]:
-        """处理 /股票 命令。"""
+        """处理 /股票 命令（自己发送回复，宿主不会代发命令响应）。"""
         del kwargs
         if not stream_id:
             return False, "缺少聊天流", True
@@ -69,6 +69,13 @@ class StockCommandMixin:
         except Exception as exc:
             logger.error("股票命令处理失败: %s", exc, exc_info=True)
             return False, "查询失败，请稍后再试", True
+        try:
+            sent = await self.ctx.send.text(reply, stream_id)
+        except Exception as exc:
+            logger.error("股票命令回复发送失败: %s", exc, exc_info=True)
+            return False, f"回复发送失败: {exc}", True
+        if not sent:
+            return False, "回复发送失败（平台未确认）", True
         return True, reply, True
 
     async def _dispatch_stock_query(self, arg: str, stream_id: str = "") -> str:
