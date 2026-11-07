@@ -1,0 +1,70 @@
+# 麦麦股票模拟盘 配置示例
+# 实际运行时配置由宿主根据 config.py 中的配置模型自动生成到本目录 config.toml，
+# 并可在 WebUI 插件设置页修改。本文件仅作参考。
+
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[general]
+# 自动模拟交易默认关闭：先用 /股票 命令确认行情正常，再手动开启
+auto_trade_enabled = false
+broadcast_stream_ids = []
+broadcast_enabled = true
+broadcast_min_interval_minutes = 10
+broadcast_daily_max = 8
+initial_cash = 1000000.0
+allowed_boards = ["SH_MAIN", "SZ_MAIN", "CHINEXT", "STAR"]
+
+[trade]
+max_position_pct = 0.20
+max_total_position_pct = 0.70
+day_loss_stop_pct = 0.03
+max_day_trades = 5
+max_orders_per_decision = 3
+slippage_bps = 10.0
+max_volume_participation = 0.01
+commission_rate = 0.00025
+min_commission = 5.0
+stamp_tax_rate = 0.0005
+transfer_fee_rate = 0.00001
+allow_risk_warning_stocks = false
+allow_new_listing = false
+min_liquidity_amount = 50000000.0
+
+[decision]
+model_name = ""
+decision_interval_minutes = 30
+min_decision_interval_minutes = 5
+max_decision_calls_per_day = 16
+max_tokens_per_day = 400000
+max_output_tokens = 2000
+candidate_pool_size = 40
+use_strategy_memory = true
+allow_watchlist_update = true
+
+[chat]
+suggestions_enabled = true
+allowed_stream_ids = []
+suggestion_ttl_hours = 24
+max_suggestions_in_context = 15
+
+[data_source]
+tencent_enabled = true
+sina_enabled = true
+akshare_enabled = true
+quote_interval_minutes = 5
+request_timeout_seconds = 8.0
+retry_count = 2
+quote_cache_ttl_seconds = 20.0
+quote_max_age_seconds = 120
+cross_source_tolerance_pct = 0.5
+request_interval_seconds = 0.5
+
+[advanced]
+settlement_time = "15:10"
+pool_refresh_time = "08:40"
+quiet_start = "23:00"
+quiet_end = "07:30"
+data_retention_days = 180
+log_level = "INFO"

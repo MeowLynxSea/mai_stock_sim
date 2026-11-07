@@ -1,0 +1,120 @@
+"""运行时状态：配置到各服务参数的映射与热更新。"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import time as dt_time
+from typing import Any, Dict, List, Optional, Set
+
+from ..config import MaiStockSimConfig
+from ..market.quotes import QuoteService
+from ..social.reporting import BroadcastGate, BroadcastPolicy
+from ..trading.execution import ExecutionEngine
+from ..trading.fees import FeeModel
+from ..trading.risk import RiskParams, RiskManager
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RuntimeState:
+    """调度器共享的运行时状态（读写都在插件事件循环内，无锁）。"""
+
+    auto_trade_enabled: bool = False
+    plugin_enabled: bool = True
+    allowed_boards: Set[str] = field(default_factory=set)
+    broadcast_stream_ids: List[str] = field(default_factory=list)
+    suggestions_enabled: bool = True
+    allowed_suggestion_streams: Set[str] = field(default_factory=set)
+    suggestion_ttl_hours: int = 24
+    use_strategy_memory: bool = True
+    allow_watchlist_update: bool = True
+    decision_model_name: str = ""
+    last_decision_at: float = 0.0
+    # 决策动态间隔：模型可通过 next_review_minutes 影响（受上下限约束）
+    next_decision_delay_minutes: Optional[float] = None
+    calendar_degraded_notified: bool = False
+
+    def apply_config(self, config: MaiStockSimConfig) -> None:
+        """把配置映射到运行时状态。"""
+        self.plugin_enabled = bool(config.plugin.enabled)
+        self.auto_trade_enabled = bool(config.general.auto_trade_enabled)
+        self.allowed_boards = set(config.general.allowed_boards)
+        self.broadcast_stream_ids = list(config.general.broadcast_stream_ids)
+        self.suggestions_enabled = bool(config.chat.suggestions_enabled)
+        self.allowed_suggestion_streams = set(config.chat.allowed_stream_ids)
+        self.suggestion_ttl_hours = int(config.chat.suggestion_ttl_hours)
+        self.use_strategy_memory = bool(config.decision.use_strategy_memory)
+        self.allow_watchlist_update = bool(config.decision.allow_watchlist_update)
+        self.decision_model_name = str(config.decision.model_name or "")
+
+
+def build_risk_params(config: MaiStockSimConfig) -> RiskParams:
+    """从配置构造风控参数。"""
+    return RiskParams(
+        max_position_pct=config.trade.max_position_pct,
+        max_total_position_pct=config.trade.max_total_position_pct,
+        day_loss_stop_pct=config.trade.day_loss_stop_pct,
+        max_day_trades=config.trade.max_day_trades,
+        max_orders_per_decision=config.trade.max_orders_per_decision,
+        min_liquidity_amount=config.trade.min_liquidity_amount,
+        allow_risk_warning=config.trade.allow_risk_warning_stocks,
+        allow_new_listing_days=1 if config.trade.allow_new_listing else 0,
+    )
+
+
+def build_fee_model(config: MaiStockSimConfig) -> FeeModel:
+    """从配置构造费用模型。"""
+    return FeeModel(
+        commission_rate=config.trade.commission_rate,
+        min_commission=config.trade.min_commission,
+        stamp_tax_rate=config.trade.stamp_tax_rate,
+        transfer_fee_rate=config.trade.transfer_fee_rate,
+    )
+
+
+def build_broadcast_policy(config: MaiStockSimConfig) -> BroadcastPolicy:
+    """从配置构造播报策略。"""
+    quiet_start = _parse_hhmm(config.advanced.quiet_start)
+    quiet_end = _parse_hhmm(config.advanced.quiet_end)
+    return BroadcastPolicy(
+        enabled=config.general.broadcast_enabled,
+        min_interval_minutes=config.general.broadcast_min_interval_minutes,
+        daily_max=config.general.broadcast_daily_max,
+        quiet_start=quiet_start,
+        quiet_end=quiet_end,
+    )
+
+
+def _parse_hhmm(text: str) -> Optional[dt_time]:
+    """解析 HH:MM 时间。"""
+    try:
+        hour, minute = str(text or "").strip().split(":")
+        return dt_time(int(hour), int(minute))
+    except (ValueError, AttributeError):
+        return None
+
+
+def apply_runtime_settings(
+    config: MaiStockSimConfig,
+    state: RuntimeState,
+    quotes: QuoteService,
+    risk: RiskManager,
+    execution: ExecutionEngine,
+    broadcast_gate: BroadcastGate,
+) -> None:
+    """一次性把配置应用到所有服务（on_load 与 on_config_update 共用）。"""
+    state.apply_config(config)
+    quotes.update_settings(
+        cache_ttl=config.data_source.quote_cache_ttl_seconds,
+        max_age_seconds=config.data_source.quote_max_age_seconds,
+        request_interval=config.data_source.request_interval_seconds,
+        cross_tolerance_pct=config.data_source.cross_source_tolerance_pct,
+    )
+    risk.update_params(build_risk_params(config))
+    execution.update_settings(
+        slippage_bps=config.trade.slippage_bps,
+        max_volume_participation=config.trade.max_volume_participation,
+    )
+    broadcast_gate.update_policy(build_broadcast_policy(config))

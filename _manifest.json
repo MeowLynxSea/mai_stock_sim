@@ -1,0 +1,56 @@
+{
+  "manifest_version": 2,
+  "version": "1.0.0",
+  "name": "麦麦股票模拟盘",
+  "description": "麦麦用自己的虚拟资金参与 A 股模拟交易：自主观察市场、维护观察列表、决定买卖时机，并像群友一样分享交易经历。使用腾讯/新浪/AKShare 公开行情，内置 T+1、涨跌幅、申报数量等 A 股交易规则与独立风控；人类只能讨论与查询，不能代替麦麦交易。仅虚拟资金，无任何实盘接口。",
+  "author": {
+    "name": "MaiStockSim Contributors",
+    "url": "https://github.com/example/mai_stock_sim"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/example/mai_stock_sim",
+    "homepage": "https://github.com/example/mai_stock_sim#readme",
+    "documentation": "https://github.com/example/mai_stock_sim/blob/main/README.md",
+    "issues": "https://github.com/example/mai_stock_sim/issues"
+  },
+  "changelog": "CHANGELOG.md",
+  "host_application": {
+    "min_version": "1.4.0",
+    "max_version": "1.4.99"
+  },
+  "sdk": {
+    "min_version": "2.20.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "akshare",
+      "version_spec": ">=1.20.0"
+    }
+  ],
+  "capabilities": [
+    "llm.generate",
+    "personality.get_current",
+    "message.get_recent",
+    "send.text",
+    "chat.get_stream_by_group_id",
+    "maisaka.context.append",
+    "maisaka.proactive.trigger"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": ["zh-CN"]
+  },
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "trending-up",
+      "fallback": "puzzle",
+      "background": "#1E3A5F"
+    }
+  },
+  "plugin_type": "extension",
+  "id": "community.mai-stock-sim"
+}
