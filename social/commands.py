@@ -50,7 +50,12 @@ class StockCommandMixin:
         matched_groups: Any = None,
         **kwargs: Any,
     ) -> Tuple[bool, str, bool]:
-        """处理 /股票 命令（自己发送回复，宿主不会代发命令响应）。"""
+        """处理 /股票 命令（回复后台发送，命令立即返回）。
+
+        平台投递回执可能远慢于能力调用超时（如 napcat 链路十几秒到几十秒），
+        同步等待会把命令链占住并产生"已送达却报超时"的假失败，
+        因此发送放入后台任务：命令本身毫秒级完成，回复稍后到达。
+        """
         del kwargs
         if not stream_id:
             return False, "缺少聊天流", True
@@ -69,14 +74,28 @@ class StockCommandMixin:
         except Exception as exc:
             logger.error("股票命令处理失败: %s", exc, exc_info=True)
             return False, "查询失败，请稍后再试", True
-        try:
-            sent = await self.ctx.send.text(reply, stream_id)
-        except Exception as exc:
-            logger.error("股票命令回复发送失败: %s", exc, exc_info=True)
-            return False, f"回复发送失败: {exc}", True
-        if not sent:
-            return False, "回复发送失败（平台未确认）", True
+        self._spawn_send_task(reply, stream_id)
         return True, reply, True
+
+    def _spawn_send_task(self, reply: str, stream_id: str) -> None:
+        """把回复发送放入后台任务并保留强引用（防 GC）。"""
+        import asyncio
+
+        tasks = getattr(self, "_stock_reply_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._stock_reply_tasks = tasks
+
+        async def _send() -> None:
+            try:
+                await self.ctx.send.text(reply, stream_id)
+            except Exception as exc:
+                # 回执超时不代表未送达（平台链路可能仍在投递），仅记录
+                logger.warning("股票命令回复发送异常（消息可能仍会送达）: %s", exc)
+
+        task = asyncio.create_task(_send())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def _dispatch_stock_query(self, arg: str, stream_id: str = "") -> str:
         """按子命令分发（全部只读）。"""

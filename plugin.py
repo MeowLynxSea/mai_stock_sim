@@ -66,6 +66,7 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
         self._broadcast_gate: Optional[BroadcastGate] = None
         self._risk: Optional[RiskManager] = None
         self._execution: Optional[ExecutionEngine] = None
+        self._reporting: Optional[ReportingService] = None
 
     # ── 生命周期 ──────────────────────────────────────────────
 
@@ -118,7 +119,8 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
         )
         settlement = SettlementEngine(self.store, self.quotes, self.calendar)
         corporate_guard = CorporateActionGuard(self.store)
-        reporting = ReportingService(self._broadcast_gate)
+        self._reporting = ReportingService(self._broadcast_gate)
+        reporting = self._reporting
 
         self.influence = SuggestionInfluence(
             self.store,
@@ -162,6 +164,9 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
         if self.scheduler is not None:
             await self.scheduler.stop()
             self.scheduler = None
+        if getattr(self, "_reporting", None) is not None:
+            await self._reporting.stop()
+            self._reporting = None
         if self.store is not None:
             self.store.close()
             self.store = None

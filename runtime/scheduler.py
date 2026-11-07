@@ -307,7 +307,7 @@ class StockScheduler:
                             report.price,
                             report.intent.reason,
                         )
-                await self._reporting.announce_trades(
+                self._reporting.announce_trades(
                     self._ctx,
                     self._state.broadcast_stream_ids,
                     output.public_comment,
@@ -394,7 +394,7 @@ class StockScheduler:
                 model_name=config.decision.model_name,
             )
             review_comment = review.get("comment", "")
-            await self._reporting.announce_daily_report(
+            self._reporting.announce_daily_report(
                 self._ctx,
                 self._state.broadcast_stream_ids,
                 result.trade_date,
