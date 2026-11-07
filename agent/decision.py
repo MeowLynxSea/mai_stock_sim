@@ -136,6 +136,7 @@ class DecisionEngine:
         personality_text: str,
         *,
         model_name: str = "",
+        budget_enabled: bool = False,
         max_calls_per_day: int = 16,
         max_tokens_per_day: int = 400_000,
         max_output_tokens: int = 2000,
@@ -143,17 +144,22 @@ class DecisionEngine:
     ) -> DecisionResult:
         """执行一轮完整决策。
 
-        流程：预算检查 → 上下文构建 → 模型调用 → 结构化解析 → 审计落库。
+        流程：预算检查（可配置关闭） → 上下文构建 → 模型调用 → 结构化解析 → 审计落库。
+
+        Args:
+            budget_enabled: 是否启用每日预算限制；False 时不限制调用次数与 Token
+                （用量仍会记录到 model_usage 统计）。
         """
         decision_id = f"dec-{today_sh().strftime('%Y%m%d')}-{uuid.uuid4().hex[:10]}"
-        budget = self.budget_remaining(max_calls_per_day, max_tokens_per_day)
-        if budget["calls_left"] <= 0 or budget["prompt_tokens_left"] <= 0:
-            return DecisionResult(
-                decision_id=decision_id,
-                output=None,
-                success=False,
-                error=f"模型预算已用尽（剩余调用 {budget['calls_left']}，剩余 tokens {budget['prompt_tokens_left']}）",
-            )
+        if budget_enabled:
+            budget = self.budget_remaining(max_calls_per_day, max_tokens_per_day)
+            if budget["calls_left"] <= 0 or budget["prompt_tokens_left"] <= 0:
+                return DecisionResult(
+                    decision_id=decision_id,
+                    output=None,
+                    success=False,
+                    error=f"模型预算已用尽（剩余调用 {budget['calls_left']}，剩余 tokens {budget['prompt_tokens_left']}）",
+                )
 
         context = await self._context_builder.build(personality_text, candidates_limit=candidates_limit)
         prompt = _SYSTEM_PROMPT_TEMPLATE.format(**{key: value or "（无）" for key, value in context.items()})

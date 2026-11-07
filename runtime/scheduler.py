@@ -220,6 +220,7 @@ class StockScheduler:
                 result = await self._decision.run_decision(
                     personality,
                     model_name=config.decision.model_name,
+                    budget_enabled=config.decision.budget_enabled,
                     max_calls_per_day=config.decision.max_decision_calls_per_day,
                     max_tokens_per_day=config.decision.max_tokens_per_day,
                     max_output_tokens=config.decision.max_output_tokens,

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, List
+from typing import Any, ClassVar, Dict, List, Literal
 
 from maibot_sdk import Field, PluginConfigBase
 
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 
 
 class PluginSection(PluginConfigBase):
@@ -45,8 +45,17 @@ class GeneralSection(PluginConfigBase):
     )
     broadcast_stream_ids: List[str] = Field(
         default_factory=list,
-        description="播报目标聊天流 ID 列表（stream_id，可从 /股票 命令所在群获取）。留空则不播报。",
-        json_schema_extra={"label": "播报聊天流", "hint": "留空则不播报", "order": 2},
+        description=(
+            "播报目标聊天流 ID（即 MaiBot 的 session_id / stream_id，WebUI 聊天流页面可查，"
+            "或在目标群发送 /股票 状态，回复末尾会显示本群的聊天流 ID）。不是 QQ 群号。"
+            "留空则不播报。"
+        ),
+        json_schema_extra={
+            "label": "播报聊天流 ID",
+            "hint": "填聊天流 ID（session_id），不是群号；留空则不播报。可在目标群发 /股票 状态 获取",
+            "placeholder": "例如 c1f2c4c6...",
+            "order": 2,
+        },
     )
     broadcast_enabled: bool = Field(
         default=True,
@@ -88,54 +97,67 @@ class TradeSection(PluginConfigBase):
     __ui_icon__: ClassVar[str] = "trending-up"
     __ui_order__: ClassVar[int] = 2
 
+    preset: Literal["conservative", "balanced", "aggressive", "unlimited", "custom"] = Field(
+        default="balanced",
+        description=(
+            "交易风格预设。选择预设后按预设参数执行（下方自定义参数不再生效）；"
+            "选「自定义」时使用下方参数。注意：任何预设（包括「无限制」）都不会解除"
+            "A 股市场规则（T+1、涨跌停、申报数量、禁止卖空与负现金）与原子记账约束。"
+        ),
+        json_schema_extra={
+            "label": "交易风格预设",
+            "hint": "无限制仅取消风控层面的仓位/频率限制，市场规则始终生效",
+            "order": 0,
+        },
+    )
     max_position_pct: float = Field(
         default=0.20,
         gt=0.01,
         le=1.0,
         description="单只股票最大仓位（占总权益比例）。",
-        json_schema_extra={"label": "单股最大仓位", "step": 0.01, "order": 1},
+        json_schema_extra={"label": "单股最大仓位", "step": 0.01, "depends_on": "preset", "depends_value": "custom", "order": 1},
     )
     max_total_position_pct: float = Field(
         default=0.70,
         gt=0.05,
         le=1.0,
         description="总持仓市值上限（占总权益比例）。",
-        json_schema_extra={"label": "总仓位上限", "step": 0.05, "order": 2},
+        json_schema_extra={"label": "总仓位上限", "step": 0.05, "depends_on": "preset", "depends_value": "custom", "order": 2},
     )
     day_loss_stop_pct: float = Field(
         default=0.03,
         gt=0.005,
         le=0.5,
         description="当日权益回撤达到该比例后停止新增买入。",
-        json_schema_extra={"label": "单日亏损停止买入阈值", "step": 0.005, "order": 3},
+        json_schema_extra={"label": "单日亏损停止买入阈值", "step": 0.005, "depends_on": "preset", "depends_value": "custom", "order": 3},
     )
     max_day_trades: int = Field(
         default=5,
         ge=1,
         le=50,
         description="每日最大成交笔数。",
-        json_schema_extra={"label": "每日最大成交笔数", "order": 4},
+        json_schema_extra={"label": "每日最大成交笔数", "depends_on": "preset", "depends_value": "custom", "order": 4},
     )
     max_orders_per_decision: int = Field(
         default=3,
         ge=1,
         le=10,
         description="每轮决策允许产生的最大订单数。",
-        json_schema_extra={"label": "每轮最大订单数", "order": 5},
+        json_schema_extra={"label": "每轮最大订单数", "depends_on": "preset", "depends_value": "custom", "order": 5},
     )
     slippage_bps: float = Field(
         default=10.0,
         ge=0.0,
         le=200.0,
         description="模拟滑点（基点）。买入上浮、卖出下浮。",
-        json_schema_extra={"label": "模拟滑点(bp)", "order": 6},
+        json_schema_extra={"label": "模拟滑点(bp)", "depends_on": "preset", "depends_value": "custom", "order": 6},
     )
     max_volume_participation: float = Field(
         default=0.01,
         gt=0.0001,
         le=0.1,
         description="单笔模拟成交占该股当日成交量的最大比例（流动性约束）。",
-        json_schema_extra={"label": "单笔成交量占比上限", "step": 0.005, "order": 7},
+        json_schema_extra={"label": "单笔成交量占比上限", "step": 0.005, "depends_on": "preset", "depends_value": "custom", "order": 7},
     )
     commission_rate: float = Field(
         default=0.00025,
@@ -168,20 +190,93 @@ class TradeSection(PluginConfigBase):
     allow_risk_warning_stocks: bool = Field(
         default=False,
         description="是否允许交易风险警示股票（ST/*ST）。",
-        json_schema_extra={"label": "允许风险警示股票", "order": 12},
+        json_schema_extra={"label": "允许风险警示股票", "depends_on": "preset", "depends_value": "custom", "order": 12},
     )
     allow_new_listing: bool = Field(
         default=False,
         description="是否允许交易上市不足 30 天的新股。",
-        json_schema_extra={"label": "允许交易新股", "order": 13},
+        json_schema_extra={"label": "允许交易新股", "depends_on": "preset", "depends_value": "custom", "order": 13},
     )
     min_liquidity_amount: float = Field(
         default=50_000_000.0,
         ge=0.0,
         le=10_000_000_000.0,
         description="候选股票最低当日成交额（元）。",
-        json_schema_extra={"label": "最低流动性要求(元)", "order": 14},
+        json_schema_extra={"label": "最低流动性要求(元)", "depends_on": "preset", "depends_value": "custom", "order": 14},
     )
+
+
+# 各预设的参数表（费用模型不在预设内，始终使用自定义费率）
+TRADE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "conservative": {
+        "max_position_pct": 0.10,
+        "max_total_position_pct": 0.40,
+        "day_loss_stop_pct": 0.02,
+        "max_day_trades": 3,
+        "max_orders_per_decision": 2,
+        "slippage_bps": 15.0,
+        "max_volume_participation": 0.005,
+        "allow_risk_warning_stocks": False,
+        "allow_new_listing": False,
+        "min_liquidity_amount": 200_000_000.0,
+    },
+    "balanced": {
+        "max_position_pct": 0.20,
+        "max_total_position_pct": 0.70,
+        "day_loss_stop_pct": 0.03,
+        "max_day_trades": 5,
+        "max_orders_per_decision": 3,
+        "slippage_bps": 10.0,
+        "max_volume_participation": 0.01,
+        "allow_risk_warning_stocks": False,
+        "allow_new_listing": False,
+        "min_liquidity_amount": 50_000_000.0,
+    },
+    "aggressive": {
+        "max_position_pct": 0.30,
+        "max_total_position_pct": 0.90,
+        "day_loss_stop_pct": 0.06,
+        "max_day_trades": 10,
+        "max_orders_per_decision": 5,
+        "slippage_bps": 8.0,
+        "max_volume_participation": 0.02,
+        "allow_risk_warning_stocks": True,
+        "allow_new_listing": False,
+        "min_liquidity_amount": 20_000_000.0,
+    },
+    "unlimited": {
+        "max_position_pct": 1.0,
+        "max_total_position_pct": 1.0,
+        "day_loss_stop_pct": 0.999,
+        "max_day_trades": 100,
+        "max_orders_per_decision": 10,
+        "slippage_bps": 5.0,
+        "max_volume_participation": 0.05,
+        "allow_risk_warning_stocks": True,
+        "allow_new_listing": True,
+        "min_liquidity_amount": 0.0,
+    },
+}
+
+
+def resolve_trade_params(config: "MaiStockSimConfig") -> Dict[str, Any]:
+    """按预设或自定义解析出实际生效的交易参数。
+
+    Returns:
+        Dict[str, Any]: 生效参数（含 preset 覆盖的风控/滑点/流动性字段；费用字段始终来自自定义配置）。
+    """
+    preset_name = str(config.trade.preset)
+    if preset_name == "custom":
+        source: Dict[str, Any] = dict(config.trade.model_dump())
+    else:
+        source = dict(TRADE_PRESETS[preset_name])
+    # 费用模型不参与预设
+    source["commission_rate"] = config.trade.commission_rate
+    source["min_commission"] = config.trade.min_commission
+    source["stamp_tax_rate"] = config.trade.stamp_tax_rate
+    source["transfer_fee_rate"] = config.trade.transfer_fee_rate
+    source["preset"] = preset_name
+    return source
 
 
 class DecisionSection(PluginConfigBase):
@@ -210,25 +305,34 @@ class DecisionSection(PluginConfigBase):
         description="允许的最短决策间隔（分钟，限制模型自行缩短观察的频率）。",
         json_schema_extra={"label": "最短决策间隔(分钟)", "order": 3},
     )
+    budget_enabled: bool = Field(
+        default=False,
+        description=(
+            "启用每日模型预算限制（每日决策次数 + Token 预算）。默认关闭即不限制"
+            "决策次数与 Token 用量（用量仍会记录统计，达到预算不再中断交易系统，"
+            "行情、风控与结算照常运行）。"
+        ),
+        json_schema_extra={"label": "启用模型预算限制", "hint": "默认关闭（不限制）", "order": 3},
+    )
     max_decision_calls_per_day: int = Field(
         default=16,
         ge=1,
         le=100,
         description="每日最大决策（模型调用）次数。",
-        json_schema_extra={"label": "每日决策次数上限", "order": 4},
+        json_schema_extra={"label": "每日决策次数上限", "depends_on": "budget_enabled", "depends_value": True, "order": 4},
     )
     max_tokens_per_day: int = Field(
         default=400_000,
         ge=10_000,
         le=10_000_000,
         description="每日模型 Token 预算。",
-        json_schema_extra={"label": "每日Token预算", "order": 5},
+        json_schema_extra={"label": "每日Token预算", "depends_on": "budget_enabled", "depends_value": True, "order": 5},
     )
     max_output_tokens: int = Field(
         default=2000,
         ge=200,
         le=8000,
-        description="单次决策最大输出 Token。",
+        description="单次决策最大输出 Token（此项不受预算开关影响，始终生效）。",
         json_schema_extra={"label": "单次最大输出Token", "order": 6},
     )
     candidate_pool_size: int = Field(
@@ -262,24 +366,41 @@ class ChatSection(PluginConfigBase):
         description="启用群聊建议识别（旁路观察，不阻塞消息链）。",
         json_schema_extra={"label": "启用群聊建议", "order": 1},
     )
+    suggestion_stream_mode: Literal["allowlist", "blocklist"] = Field(
+        default="allowlist",
+        description=(
+            "聊天流监听模式。白名单：只监听下方列表中的聊天流（列表为空 = 不监听任何群）；"
+            "黑名单：监听除下方列表外的所有聊天流（列表为空 = 监听全部，注意范围）。"
+        ),
+        json_schema_extra={"label": "监听模式", "hint": "白名单=只监听列出的；黑名单=监听除列出外的全部", "order": 2},
+    )
     allowed_stream_ids: List[str] = Field(
         default_factory=list,
-        description="允许读取消息的聊天流 ID（stream_id）。留空则不监听任何群。",
-        json_schema_extra={"label": "允许读取的聊天流", "hint": "留空不监听", "order": 2},
+        description=(
+            "聊天流 ID 列表（即 MaiBot 的 session_id / stream_id，不是 QQ 群号）。"
+            "WebUI 聊天流页面可查，或在目标群发送 /股票 状态，回复末尾会显示本群聊天流 ID。"
+            "白名单模式下留空 = 不监听任何群；黑名单模式下留空 = 监听全部聊天流。"
+        ),
+        json_schema_extra={
+            "label": "聊天流 ID 列表",
+            "hint": "填聊天流 ID（session_id），不是群号；可在目标群发 /股票 状态 获取",
+            "placeholder": "例如 c1f2c4c6...",
+            "order": 3,
+        },
     )
     suggestion_ttl_hours: int = Field(
         default=24,
         ge=1,
         le=168,
         description="建议保留时长（小时），过期自动清理。",
-        json_schema_extra={"label": "建议有效时间(小时)", "order": 3},
+        json_schema_extra={"label": "建议有效时间(小时)", "order": 4},
     )
     max_suggestions_in_context: int = Field(
         default=15,
         ge=1,
         le=50,
         description="每轮决策上下文携带的最大建议条数。",
-        json_schema_extra={"label": "上下文建议上限", "order": 4},
+        json_schema_extra={"label": "上下文建议上限", "order": 5},
     )
 
 

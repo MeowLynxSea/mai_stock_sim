@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import time as dt_time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ..config import MaiStockSimConfig
+from ..config import MaiStockSimConfig, resolve_trade_params
 from ..market.quotes import QuoteService
 from ..social.reporting import BroadcastGate, BroadcastPolicy
 from ..trading.execution import ExecutionEngine
@@ -26,11 +26,13 @@ class RuntimeState:
     allowed_boards: Set[str] = field(default_factory=set)
     broadcast_stream_ids: List[str] = field(default_factory=list)
     suggestions_enabled: bool = True
+    suggestion_stream_mode: str = "allowlist"
     allowed_suggestion_streams: Set[str] = field(default_factory=set)
     suggestion_ttl_hours: int = 24
     use_strategy_memory: bool = True
     allow_watchlist_update: bool = True
     decision_model_name: str = ""
+    budget_enabled: bool = False
     last_decision_at: float = 0.0
     # 决策动态间隔：模型可通过 next_review_minutes 影响（受上下限约束）
     next_decision_delay_minutes: Optional[float] = None
@@ -43,24 +45,31 @@ class RuntimeState:
         self.allowed_boards = set(config.general.allowed_boards)
         self.broadcast_stream_ids = list(config.general.broadcast_stream_ids)
         self.suggestions_enabled = bool(config.chat.suggestions_enabled)
+        self.suggestion_stream_mode = str(config.chat.suggestion_stream_mode)
         self.allowed_suggestion_streams = set(config.chat.allowed_stream_ids)
         self.suggestion_ttl_hours = int(config.chat.suggestion_ttl_hours)
         self.use_strategy_memory = bool(config.decision.use_strategy_memory)
         self.allow_watchlist_update = bool(config.decision.allow_watchlist_update)
         self.decision_model_name = str(config.decision.model_name or "")
+        self.budget_enabled = bool(config.decision.budget_enabled)
+
+    def stream_access(self) -> Tuple[str, Set[str]]:
+        """返回建议监听的（模式, 聊天流集合）。"""
+        return self.suggestion_stream_mode, self.allowed_suggestion_streams
 
 
 def build_risk_params(config: MaiStockSimConfig) -> RiskParams:
-    """从配置构造风控参数。"""
+    """从配置构造风控参数（预设优先，自定义模式使用逐项配置）。"""
+    params = resolve_trade_params(config)
     return RiskParams(
-        max_position_pct=config.trade.max_position_pct,
-        max_total_position_pct=config.trade.max_total_position_pct,
-        day_loss_stop_pct=config.trade.day_loss_stop_pct,
-        max_day_trades=config.trade.max_day_trades,
-        max_orders_per_decision=config.trade.max_orders_per_decision,
-        min_liquidity_amount=config.trade.min_liquidity_amount,
-        allow_risk_warning=config.trade.allow_risk_warning_stocks,
-        allow_new_listing_days=1 if config.trade.allow_new_listing else 0,
+        max_position_pct=float(params["max_position_pct"]),
+        max_total_position_pct=float(params["max_total_position_pct"]),
+        day_loss_stop_pct=float(params["day_loss_stop_pct"]),
+        max_day_trades=int(params["max_day_trades"]),
+        max_orders_per_decision=int(params["max_orders_per_decision"]),
+        min_liquidity_amount=float(params["min_liquidity_amount"]),
+        allow_risk_warning=bool(params["allow_risk_warning_stocks"]),
+        allow_new_listing_days=1 if params["allow_new_listing"] else 0,
     )
 
 
@@ -113,8 +122,9 @@ def apply_runtime_settings(
         cross_tolerance_pct=config.data_source.cross_source_tolerance_pct,
     )
     risk.update_params(build_risk_params(config))
+    params = resolve_trade_params(config)
     execution.update_settings(
-        slippage_bps=config.trade.slippage_bps,
-        max_volume_participation=config.trade.max_volume_participation,
+        slippage_bps=float(params["slippage_bps"]),
+        max_volume_participation=float(params["max_volume_participation"]),
     )
     broadcast_gate.update_policy(build_broadcast_policy(config))

@@ -17,7 +17,7 @@ from ..market.symbols import display_symbol, is_valid_symbol, normalize_symbol
 logger = logging.getLogger(__name__)
 
 _HELP_TEXT = """【麦麦股票模拟盘·只读查询】（虚拟资金模拟，非实盘）
-/股票 状态 —— 账户总览（权益/现金/仓位）
+/股票 状态 —— 账户总览（权益/现金/仓位，末尾附本群聊天流 ID）
 /股票 持仓 —— 当前持仓明细（含可卖数量）
 /股票 行情 600519 —— 查询某只股票实时行情
 /股票 观察 —— 麦麦的观察列表
@@ -65,13 +65,13 @@ class StockCommandMixin:
                     arg = stripped[len(prefix) :].strip()
                     break
         try:
-            reply = await self._dispatch_stock_query(arg)
+            reply = await self._dispatch_stock_query(arg, stream_id=stream_id)
         except Exception as exc:
             logger.error("股票命令处理失败: %s", exc, exc_info=True)
             return False, "查询失败，请稍后再试", True
         return True, reply, True
 
-    async def _dispatch_stock_query(self, arg: str) -> str:
+    async def _dispatch_stock_query(self, arg: str, stream_id: str = "") -> str:
         """按子命令分发（全部只读）。"""
         parts = arg.split()
         sub = parts[0] if parts else "状态"
@@ -80,7 +80,7 @@ class StockCommandMixin:
         if sub in ("帮助", "help", "?", "？"):
             return _HELP_TEXT
         if sub == "状态":
-            return self._build_status_text(store)
+            return self._build_status_text(store, stream_id=stream_id)
         if sub == "持仓":
             return self._build_positions_text(store)
         if sub == "行情":
@@ -97,8 +97,8 @@ class StockCommandMixin:
             return await self._build_quote_text(sub)
         return f"未知的查询内容：{arg or '（空）'}\n{_HELP_TEXT}"
 
-    def _build_status_text(self, store) -> str:
-        """账户总览。"""
+    def _build_status_text(self, store, stream_id: str = "") -> str:
+        """账户总览（附本群聊天流 ID，便于配置播报/监听）。"""
         if not store.account_exists():
             return "模拟盘账户尚未初始化。"
         snapshot = store.snapshot(lambda symbol: self.quotes.peek_cached_price(symbol))  # type: ignore[attr-defined]
@@ -116,6 +116,8 @@ class StockCommandMixin:
         risk_events = store.day_risk_events()
         if risk_events:
             lines.append(f"今日风控拦截 {len(risk_events)} 次")
+        if stream_id:
+            lines.append(f"本群聊天流 ID：{stream_id}（配置播报/监听聊天流时填这个，不是群号）")
         return "\n".join(lines)
 
     def _build_positions_text(self, store) -> str:

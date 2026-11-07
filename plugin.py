@@ -24,7 +24,7 @@ from .agent.context import DecisionContextBuilder
 from .agent.decision import DecisionEngine
 from .agent.stock_selection import CandidatePoolBuilder
 from .agent.strategy_memory import StrategyMemory
-from .config import MaiStockSimConfig
+from .config import MaiStockSimConfig, resolve_trade_params
 from .market.calendar import TradeCalendar
 from .market.quotes import QuoteService
 from .runtime.scheduler import StockScheduler
@@ -95,14 +95,15 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
         self._broadcast_gate = BroadcastGate(build_broadcast_policy(config))
         self._risk = RiskManager(self.store, build_risk_params(config))
         fees = build_fee_model(config)
+        effective_trade = resolve_trade_params(config)
         self._execution = ExecutionEngine(
             self.store,
             self.quotes,
             self.calendar,
             self._risk,
             fees,
-            slippage_bps=config.trade.slippage_bps,
-            max_volume_participation=config.trade.max_volume_participation,
+            slippage_bps=float(effective_trade["slippage_bps"]),
+            max_volume_participation=float(effective_trade["max_volume_participation"]),
         )
         memory = StrategyMemory(self.store)
         pool_builder = CandidatePoolBuilder(self.store)
@@ -121,7 +122,7 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
 
         self.influence = SuggestionInfluence(
             self.store,
-            lambda: self._state.allowed_suggestion_streams if self._state else set(),
+            lambda: self._state.stream_access() if self._state else ("allowlist", set()),
             ttl_hours=config.chat.suggestion_ttl_hours,
         )
         self.influence.refresh_dictionary()

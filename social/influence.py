@@ -33,18 +33,24 @@ _DEFAULT_TTL_HOURS = 24
 
 
 class SuggestionInfluence:
-    """群聊股票讨论的旁路观察器。"""
+    """群聊股票讨论的旁路观察器。
 
-    def __init__(self, store, allowlist_provider, ttl_hours: int = _DEFAULT_TTL_HOURS) -> None:
+    监听范围支持两种模式（由回调返回）：
+    - ``allowlist``：只监听列表中的聊天流（空列表 = 不监听任何群，最保守）；
+    - ``blocklist``：监听列表之外的全部聊天流（空列表 = 监听全部）。
+    """
+
+    def __init__(self, store, stream_access_provider, ttl_hours: int = _DEFAULT_TTL_HOURS) -> None:
         """初始化建议识别器。
 
         Args:
             store: AccountStore。
-            allowlist_provider: 返回允许监听的 stream_id 集合的回调。
+            stream_access_provider: 返回 ``(模式, 聊天流 ID 集合)`` 的回调，
+                模式为 ``allowlist`` 或 ``blocklist``。
             ttl_hours: 建议保留时长。
         """
         self._store = store
-        self._allowlist_provider = allowlist_provider
+        self._stream_access_provider = stream_access_provider
         self._ttl_hours = max(1, ttl_hours)
         self._name_dictionary: Dict[str, str] = {}
         self._dictionary_loaded_at: Optional[Any] = None
@@ -71,9 +77,11 @@ class SuggestionInfluence:
         self._dictionary_loaded_at = now_sh()
 
     def allowed_stream(self, stream_id: str) -> bool:
-        """判断是否允许读取该聊天流。"""
-        allowlist = self._allowlist_provider()
-        return stream_id in allowlist
+        """判断是否允许读取该聊天流（按当前模式）。"""
+        mode, streams = self._stream_access_provider()
+        if mode == "blocklist":
+            return stream_id not in streams
+        return stream_id in streams
 
     def extract_symbols(self, text: str) -> List[str]:
         """从文本中提取涉及的股票代码（代码直写 + 名称词典匹配）。"""

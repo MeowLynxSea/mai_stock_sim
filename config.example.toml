@@ -4,11 +4,13 @@
 
 [plugin]
 enabled = true
-config_version = "1.0.0"
+config_version = "1.1.0"
 
 [general]
 # 自动模拟交易默认关闭：先用 /股票 命令确认行情正常，再手动开启
 auto_trade_enabled = false
+# 聊天流 ID（session_id/stream_id），不是 QQ 群号。
+# 在目标群发送 /股票 状态，回复末尾会显示本群的聊天流 ID；也可在 WebUI 聊天流页面查询。
 broadcast_stream_ids = []
 broadcast_enabled = true
 broadcast_min_interval_minutes = 10
@@ -17,6 +19,10 @@ initial_cash = 1000000.0
 allowed_boards = ["SH_MAIN", "SZ_MAIN", "CHINEXT", "STAR"]
 
 [trade]
+# 交易风格预设：conservative（保守）/ balanced（平衡，默认）/ aggressive（激进）
+# / unlimited（无限制，仅取消风控层限制，市场规则仍生效）/ custom（自定义，用下面的参数）
+preset = "balanced"
+# 以下参数仅在 preset = "custom" 时生效
 max_position_pct = 0.20
 max_total_position_pct = 0.70
 day_loss_stop_pct = 0.03
@@ -24,18 +30,22 @@ max_day_trades = 5
 max_orders_per_decision = 3
 slippage_bps = 10.0
 max_volume_participation = 0.01
+allow_risk_warning_stocks = false
+allow_new_listing = false
+min_liquidity_amount = 50000000.0
+# 费用模型不参与预设，始终使用以下参数
 commission_rate = 0.00025
 min_commission = 5.0
 stamp_tax_rate = 0.0005
 transfer_fee_rate = 0.00001
-allow_risk_warning_stocks = false
-allow_new_listing = false
-min_liquidity_amount = 50000000.0
 
 [decision]
 model_name = ""
 decision_interval_minutes = 30
 min_decision_interval_minutes = 5
+# 模型预算限制默认关闭（不限制决策次数与 Token；用量仍会记录统计）
+budget_enabled = false
+# 以下两项仅在 budget_enabled = true 时生效
 max_decision_calls_per_day = 16
 max_tokens_per_day = 400000
 max_output_tokens = 2000
@@ -45,6 +55,10 @@ allow_watchlist_update = true
 
 [chat]
 suggestions_enabled = true
+# 监听模式：allowlist（白名单，只监听列表中的流；空列表 = 不监听任何群）
+#           blocklist（黑名单，监听列表之外的全部流；空列表 = 监听全部）
+suggestion_stream_mode = "allowlist"
+# 聊天流 ID（session_id/stream_id），不是 QQ 群号；获取方式同 [general] 播报配置
 allowed_stream_ids = []
 suggestion_ttl_hours = 24
 max_suggestions_in_context = 15

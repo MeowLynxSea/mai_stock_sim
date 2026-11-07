@@ -144,9 +144,11 @@ class TestDecisionEngine:
                 "model": "m",
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
             }
-            result = await engine.run_decision("人格", max_calls_per_day=3, max_tokens_per_day=100000)
+            result = await engine.run_decision(
+                "人格", budget_enabled=True, max_calls_per_day=3, max_tokens_per_day=100000
+            )
             assert result.success
-        result = await engine.run_decision("人格", max_calls_per_day=3, max_tokens_per_day=100000)
+        result = await engine.run_decision("人格", budget_enabled=True, max_calls_per_day=3, max_tokens_per_day=100000)
         assert not result.success
         assert "预算" in result.error
 

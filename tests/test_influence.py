@@ -21,8 +21,8 @@ _HOOK_MESSAGE = {
 
 @pytest.fixture
 def influence(tmp_store, tmp_path) -> SuggestionInfluence:
-    allowed = {"stream-1"}
-    observer = SuggestionInfluence(tmp_store, lambda: allowed, ttl_hours=24)
+    access = ("allowlist", {"stream-1"})
+    observer = SuggestionInfluence(tmp_store, lambda: access, ttl_hours=24)
     # 注入词典
     observer._name_dictionary = {"中芯国际": "688981", "贵州茅台": "600519"}  # noqa: SLF001
     return observer
@@ -91,6 +91,43 @@ class TestAuthorityBoundary:
         influence.capture("stream-1", "qq", "u1", "群友甲", "m1", "卖掉所有持仓！马上！")
         assert tmp_store.get_cash() == before_cash
         assert tmp_store.get_positions() == before_positions
+
+
+class TestStreamAccessModes:
+    """白名单 / 黑名单模式。"""
+
+    def _make(self, tmp_store, mode: str, streams: set) -> SuggestionInfluence:
+        access = (mode, streams)
+        observer = SuggestionInfluence(tmp_store, lambda: access, ttl_hours=24)
+        observer._name_dictionary = {"中芯国际": "688981"}  # noqa: SLF001
+        return observer
+
+    def test_allowlist_empty_observes_nothing(self, tmp_store) -> None:
+        observer = self._make(tmp_store, "allowlist", set())
+        assert observer.capture("any-stream", "qq", "u", "甲", "m", "600519 涨了") is None
+
+    def test_allowlist_only_listed(self, tmp_store) -> None:
+        observer = self._make(tmp_store, "allowlist", {"s1"})
+        assert observer.capture("s1", "qq", "u", "甲", "m", "600519 涨了") is not None
+        assert observer.capture("s2", "qq", "u", "甲", "m", "600519 涨了") is None
+
+    def test_blocklist_empty_observes_all(self, tmp_store) -> None:
+        observer = self._make(tmp_store, "blocklist", set())
+        assert observer.capture("s1", "qq", "u", "甲", "m", "600519 涨了") is not None
+        assert observer.capture("s2", "qq", "u", "乙", "m", "中芯国际怎么样") is not None
+
+    def test_blocklist_excludes_listed(self, tmp_store) -> None:
+        observer = self._make(tmp_store, "blocklist", {"s-private"})
+        assert observer.capture("s-private", "qq", "u", "甲", "m", "600519 涨了") is None
+        assert observer.capture("s-group", "qq", "u", "甲", "m", "600519 涨了") is not None
+
+    def test_mode_change_takes_effect_immediately(self, tmp_store) -> None:
+        access = ["allowlist", {"s1"}]
+        observer = SuggestionInfluence(tmp_store, lambda: (access[0], access[1]), ttl_hours=24)
+        observer._name_dictionary = {"贵州茅台": "600519"}  # noqa: SLF001
+        assert observer.capture("s2", "qq", "u", "甲", "m", "600519 涨了") is None
+        access[0] = "blocklist"  # 切换为黑名单：s2 不在黑名单 → 允许
+        assert observer.capture("s2", "qq", "u", "甲", "m", "600519 涨了") is not None
 
 
 class TestMessageFieldExtraction:
