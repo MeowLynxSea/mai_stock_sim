@@ -4,7 +4,7 @@
 
 [plugin]
 enabled = true
-config_version = "1.1.0"
+config_version = "1.2.0"
 
 [general]
 # 自动模拟交易默认关闭：先用 /股票 命令确认行情正常，再手动开启
@@ -17,6 +17,9 @@ broadcast_min_interval_minutes = 10
 broadcast_daily_max = 8
 initial_cash = 1000000.0
 allowed_boards = ["SH_MAIN", "SZ_MAIN", "CHINEXT", "STAR"]
+# 允许使用 /股票 重置（清仓并重设初始余额）的用户，格式 platform:用户ID（如 qq:123456789）
+# 留空（默认）= 没有人可以通过聊天重置账户；重置需要二次确认，全程写入审计记录
+reset_allowed_users = []
 
 [trade]
 # 交易风格预设：conservative（保守）/ balanced（平衡，默认）/ aggressive（激进）

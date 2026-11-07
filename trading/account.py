@@ -700,6 +700,103 @@ class AccountStore:
                 conn.rollback()
                 raise
 
+    # ── 管理员重置（账户管理操作，非市场交易） ─────────────────
+
+    def admin_reset(
+        self,
+        new_initial_cash: float,
+        price_lookup,
+        operator: str = "",
+    ) -> Dict[str, Any]:
+        """管理员重置：清仓并把现金与初始资金重设为指定值。
+
+        这是账户管理操作而非市场交易：清仓不经过撮合引擎，按参考价
+        （最新缓存价，缺省用成本价）折算价值并全部记入审计事件；
+        历史成交、决策与净值记录**保留不删**，重置本身也写入 cash_events
+        与 risk_events 留痕。
+
+        Args:
+            new_initial_cash: 重设后的初始资金（也是新现金余额）。
+            price_lookup: symbol -> 参考价回调（None 时用持仓成本价）。
+            operator: 执行者标识（审计用）。
+
+        Returns:
+            Dict[str, Any]: 重置摘要（清仓明细、清零前权益、新初始资金等）。
+        """
+        if new_initial_cash <= 0:
+            raise ValueError("新初始资金必须为正数")
+        conn = self.connection()
+        now = now_sh().isoformat()
+        today = today_sh().isoformat()
+        with self._write_lock:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # 1. 清仓：按参考价折算价值计入现金（审计逐票留痕）
+                liquidated: List[Dict[str, Any]] = []
+                positions = conn.execute("SELECT * FROM positions WHERE qty > 0").fetchall()
+                total_liquidation = 0.0
+                for row in positions:
+                    qty = int(row["qty"])
+                    price = price_lookup(row["symbol"])
+                    if price is None or price <= 0:
+                        price = float(row["avg_cost"])
+                    value = round(price * qty, 2)
+                    total_liquidation += value
+                    liquidated.append(
+                        {"symbol": row["symbol"], "name": row["name"], "qty": qty, "price": price, "value": value}
+                    )
+                    conn.execute(
+                        "INSERT INTO cash_events(event_type, amount, ref_id, note, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            "admin_liquidation",
+                            value,
+                            None,
+                            f"管理员重置清仓 {row['symbol']} {qty}股 @ {price:.2f}",
+                            now,
+                        ),
+                    )
+                if total_liquidation:
+                    conn.execute("UPDATE accounts SET cash = cash + ?, updated_at = ? WHERE id = 1", (round(total_liquidation, 2), now))
+                conn.execute("UPDATE positions SET qty = 0, avg_cost = 0.0, updated_at = ? WHERE qty > 0", (now,))
+                conn.execute("DELETE FROM position_lots")
+
+                # 2. 重设现金与初始资金（清零前状态留痕）
+                before = conn.execute("SELECT cash, initial_cash FROM accounts WHERE id = 1").fetchone()
+                conn.execute(
+                    "INSERT INTO cash_events(event_type, amount, ref_id, note, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "admin_reset",
+                        round(float(new_initial_cash), 2),
+                        None,
+                        f"管理员重置账户：清零前现金 {float(before['cash']):.2f}（初始资金 {float(before['initial_cash']):.2f}）"
+                        f"→ 新初始资金 {new_initial_cash:.2f}；执行者 {operator or '未标识'}",
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE accounts SET initial_cash = ?, cash = ?, updated_at = ? WHERE id = 1",
+                    (round(float(new_initial_cash), 2), round(float(new_initial_cash), 2), now),
+                )
+                conn.execute(
+                    "INSERT INTO risk_events(trade_date, symbol, rule, detail, created_at) VALUES (?, NULL, ?, ?, ?)",
+                    (today, "admin_reset", f"账户被管理员重置，新初始资金 {new_initial_cash:.2f}，执行者 {operator or '未标识'}", now),
+                )
+
+                # 3. 删除今日净值快照（如有），收盘结算按新状态重建
+                conn.execute("DELETE FROM daily_equity WHERE trade_date >= ?", (today,))
+
+                # 4. 今日风控/成交频率计数基于 fills 表（历史保留），重置后自然重新累计
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return {
+            "liquidated": liquidated,
+            "liquidation_total": round(total_liquidation, 2),
+            "cash_before": round(float(before["cash"]), 2),
+            "new_initial_cash": round(float(new_initial_cash), 2),
+        }
+
     # ── 结算与快照 ────────────────────────────────────────────
 
     def save_daily_equity(

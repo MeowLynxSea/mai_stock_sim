@@ -6,7 +6,7 @@ from typing import Any, ClassVar, Dict, List, Literal
 
 from maibot_sdk import Field, PluginConfigBase
 
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 
 
 class PluginSection(PluginConfigBase):
@@ -87,6 +87,20 @@ class GeneralSection(PluginConfigBase):
         default_factory=lambda: ["SH_MAIN", "SZ_MAIN", "CHINEXT", "STAR"],
         description="允许交易的市场板块（SH_MAIN/SZ_MAIN/CHINEXT/STAR/BSE）。",
         json_schema_extra={"label": "允许的板块", "order": 7},
+    )
+    reset_allowed_users: List[str] = Field(
+        default_factory=list,
+        description=(
+            "允许使用 /股票 重置（清仓并重设初始余额）的用户，格式 platform:用户ID，"
+            "如 qq:123456789。留空（默认）= 没有人可以通过聊天重置账户。"
+            "重置需要二次确认，全程写入审计记录。"
+        ),
+        json_schema_extra={
+            "label": "重置命令允许的用户",
+            "hint": "格式 platform:用户ID（如 qq:123456789）；留空 = 禁用聊天重置",
+            "placeholder": "例如 qq:123456789",
+            "order": 8,
+        },
     )
 
 

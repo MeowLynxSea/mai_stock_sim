@@ -23,6 +23,9 @@ _HELP_TEXT = """【麦麦股票模拟盘·只读查询】（虚拟资金模拟�
 /股票 观察 —— 麦麦的观察列表
 /股票 记录 —— 最近交易记录
 /股票 复盘 —— 最近结算与净值走势
+管理员专属：
+/股票 重置 [新初始资金] —— 预览重置（清仓并重设初始余额）
+/股票 重置 确认 [新初始资金] —— 执行重置（需在配置中授权）
 所有交易均由麦麦自主决策，人工不能指定买卖。"""
 
 _COMMAND_PATTERN = r"^/股票\s*(?P<stock_cmd>.*)$"
@@ -47,6 +50,9 @@ class StockCommandMixin:
         self,
         text: str = "",
         stream_id: str = "",
+        platform: str = "",
+        user_id: str = "",
+        is_local_operator: bool = False,
         matched_groups: Any = None,
         **kwargs: Any,
     ) -> Tuple[bool, str, bool]:
@@ -69,8 +75,9 @@ class StockCommandMixin:
                 if stripped.startswith(prefix):
                     arg = stripped[len(prefix) :].strip()
                     break
+        auth = (platform, user_id, bool(is_local_operator))
         try:
-            reply = await self._dispatch_stock_query(arg, stream_id=stream_id)
+            reply = await self._dispatch_stock_query(arg, stream_id=stream_id, auth=auth)
         except Exception as exc:
             logger.error("股票命令处理失败: %s", exc, exc_info=True)
             return False, "查询失败，请稍后再试", True
@@ -97,8 +104,13 @@ class StockCommandMixin:
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
-    async def _dispatch_stock_query(self, arg: str, stream_id: str = "") -> str:
-        """按子命令分发（全部只读）。"""
+    async def _dispatch_stock_query(
+        self,
+        arg: str,
+        stream_id: str = "",
+        auth: Tuple[str, str, bool] = ("", "", False),
+    ) -> str:
+        """按子命令分发（查询只读；重置为管理员操作）。"""
         parts = arg.split()
         sub = parts[0] if parts else "状态"
         store = self.store  # type: ignore[attr-defined]
@@ -119,9 +131,74 @@ class StockCommandMixin:
             return self._build_trades_text(store)
         if sub in ("复盘", "结算", "净值"):
             return self._build_review_text(store)
+        if sub in ("重置", "reset"):
+            return self._handle_reset(store, parts[1:], auth)
         if sub and is_valid_symbol(sub):
             return await self._build_quote_text(sub)
         return f"未知的查询内容：{arg or '（空）'}\n{_HELP_TEXT}"
+
+    # ── 管理员重置（账户管理操作，非市场交易） ─────────────────
+
+    def _reset_allowed(self, auth: Tuple[str, str, bool]) -> bool:
+        """判断发送者是否有权执行重置。
+
+        允许：本地操作台消息，或在配置 reset_allowed_users 中
+        （格式 ``platform:user_id``，如 ``qq:123456789``）的用户。
+        默认列表为空 = 聊天通道无人可重置。
+        """
+        platform, user_id, is_local_operator = auth
+        if is_local_operator:
+            return True
+        if not platform or not user_id:
+            return False
+        allowed = set(self._get_config().general.reset_allowed_users)  # type: ignore[attr-defined]
+        return f"{platform}:{user_id}" in allowed
+
+    def _handle_reset(self, store, args: List[str], auth: Tuple[str, str, bool]) -> str:
+        """处理 /股票 重置 [确认] [新初始资金]。"""
+        if not store.account_exists():
+            return "模拟盘账户尚未初始化。"
+        if not self._reset_allowed(auth):
+            logger.warning("未授权用户尝试重置模拟盘账户: %s", auth[0:2])
+            return "你没有权限执行账户重置。该操作需要在插件配置（reset_allowed_users）中授权。"
+
+        confirmed = bool(args) and args[0] in ("确认", "confirm", "yes")
+        amount_args = args[1:] if confirmed else args
+        config = self._get_config()  # type: ignore[attr-defined]
+        try:
+            new_cash = float(amount_args[0]) if amount_args else float(config.general.initial_cash)
+        except (ValueError, TypeError):
+            return "新初始资金格式不正确，请输入数字（例如 /股票 重置 确认 500000）。"
+        if not (1000.0 <= new_cash <= 1_000_000_000.0):
+            return "新初始资金需要在 1,000 ~ 1,000,000,000 元之间。"
+
+        snapshot = store.snapshot(lambda symbol: self.quotes.peek_cached_price(symbol))  # type: ignore[attr-defined]
+        if not confirmed:
+            lines = [
+                "【重置预览】（不会执行任何操作）",
+                f"当前权益 {_fmt_money(snapshot.total_equity)} 元 = 现金 {_fmt_money(snapshot.cash)} + 持仓 {len(snapshot.positions)} 只（市值 {_fmt_money(snapshot.market_value)}）",
+                f"重置后将：全部持仓按参考价折算清仓 → 现金与初始资金重设为 {_fmt_money(new_cash)} 元",
+                "历史成交与决策记录保留，重置操作写入审计记录。",
+                f"确认执行请发送：/股票 重置 确认{' ' + amount_args[0] if amount_args else ''}",
+            ]
+            return "\n".join(lines)
+
+        operator = f"{auth[0]}:{auth[1]}" if auth[0] and auth[1] else "本地操作台"
+        try:
+            result = store.admin_reset(new_cash, lambda symbol: self.quotes.peek_cached_price(symbol), operator=operator)  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.error("模拟盘账户重置失败: %s", exc, exc_info=True)
+            return f"重置失败：{exc}"
+        lines = [
+            "【麦麦股票模拟盘·账户已重置】（管理员操作，全程留痕）",
+            f"清零前现金 {_fmt_money(result['cash_before'])} 元；清仓 {len(result['liquidated'])} 只，折算合计 {_fmt_money(result['liquidation_total'])} 元",
+            f"新初始资金与现金余额：{_fmt_money(result['new_initial_cash'])} 元",
+            "麦麦将带着新的虚拟资金重新开始，历史记录仍可通过 /股票 记录、/股票 复盘 查询。",
+        ]
+        for item in result["liquidated"][:8]:
+            lines.append(f"- 清仓 {item['name']}({item['symbol']}) {item['qty']}股 @ {item['price']:.2f}")
+        logger.info("模拟盘账户已被管理员重置: %s（新初始资金 %.2f）", operator, new_cash)
+        return "\n".join(lines)
 
     def _build_status_text(self, store, stream_id: str = "") -> str:
         """账户总览（附本群聊天流 ID，便于配置播报/监听）。"""
@@ -230,7 +307,12 @@ class StockCommandMixin:
 
 
 def is_readonly_command(arg: str) -> bool:
-    """所有 /股票 子命令都是只读的；此函数供测试确认命令集不含任何交易动作。"""
+    """判断 /股票 子命令是否为只读查询。
+
+    「重置」是唯一的管理员账户操作（清仓+重设初始余额，需配置授权与二次确认），
+    不属于只读集合；此函数供测试确认：除重置外命令集不含任何改变账户的动作，
+    且不存在任何交易动作（买入/卖出指定股票）。
+    """
     parts = arg.split()
     sub = parts[0] if parts else "状态"
     return sub in {"帮助", "help", "?", "？", "状态", "持仓", "行情", "观察", "观察列表", "自选", "记录", "交易", "成交", "复盘", "结算", "净值"} or (
