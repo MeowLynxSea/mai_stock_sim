@@ -254,30 +254,47 @@ class StockToolMixin:
     @Tool(
         "get_sim_performance",
         description=(
-            "查询麦麦模拟盘的历史净值与收益表现：近期每日权益、当日盈亏、"
-            "累计已实现盈亏。用于：群友问麦麦炒股赚了还是亏了。只读。"
+            "查询麦麦模拟盘的历史净值与收益表现：总收益、年化、最大回撤、胜率、"
+            "与沪深300的对比、近期每日权益。用于：群友问麦麦炒股赚了还是亏了、"
+            "水平怎么样。只读。"
         ),
     )
     async def tool_get_sim_performance(self, **kwargs: Any) -> Dict[str, Any]:
-        """收益表现。"""
+        """收益表现（净值曲线、最大回撤、胜率与基准对比）。"""
         del kwargs
-        history: List[Dict[str, Any]] = self.store.equity_history(limit=30)
-        if not history:
+        analytics = getattr(self, "analytics", None)
+        if analytics is None:
+            history: List[Dict[str, Any]] = self.store.equity_history(limit=30)
+            if not history:
+                return {"success": False, "error": "还没有结算记录"}
+            first = float(history[0]["total_equity"])
+            last = float(history[-1]["total_equity"])
+            return {
+                "success": True,
+                "latest_equity": last,
+                "period_return_pct": round((last / first - 1) * 100, 2) if first else 0.0,
+                "total_realized_pnl": round(self.store.total_realized_pnl(), 2),
+                "daily": [
+                    {"date": row["trade_date"], "equity": row["total_equity"], "day_pnl": row["day_pnl"]}
+                    for row in history[-10:]
+                ],
+            }
+        overview = analytics.overview()
+        if not overview.get("initialized"):
             return {"success": False, "error": "还没有结算记录"}
-        first = float(history[0]["total_equity"])
-        last = float(history[-1]["total_equity"])
         return {
             "success": True,
-            "latest_equity": last,
-            "period_return_pct": round((last / first - 1) * 100, 2) if first else 0.0,
+            "latest_equity": overview["latest_equity"],
+            "total_return_pct": overview["total_return_pct"],
+            "annualized_return_pct": overview["annualized_return_pct"],
+            "max_drawdown_pct": overview["drawdown"]["max_drawdown_pct"],
+            "win_rate_pct": overview["trades"]["win_rate_pct"],
+            "closed_trades": overview["trades"]["closed_trades"],
+            "benchmark_return_pct": overview["benchmark_return_pct"],
             "total_realized_pnl": round(self.store.total_realized_pnl(), 2),
             "daily": [
-                {
-                    "date": row["trade_date"],
-                    "equity": row["total_equity"],
-                    "day_pnl": row["day_pnl"],
-                }
-                for row in history[-10:]
+                {"date": point["date"], "equity": point["equity"], "day_pnl": point["day_pnl"]}
+                for point in overview["curve"][-10:]
             ],
         }
 

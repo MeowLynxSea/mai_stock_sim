@@ -21,16 +21,19 @@ from datetime import datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from ..agent.decision import DecisionEngine
+from ..agent.research import ResearchNotes
 from ..agent.stock_selection import CandidatePoolBuilder
 from ..agent.strategy_memory import StrategyMemory
 from ..market.calendar import SessionPhase, TradeCalendar, now_sh, today_sh
 from ..market.quotes import QuoteService
 from ..market.symbols import exchange_and_board
 from ..social.reporting import ReportingService
+from ..social.semantic import SuggestionAnalyzer
 from ..trading.account import AccountStore
 from ..trading.corporate_actions import CorporateActionGuard
 from ..trading.execution import ExecutionEngine, TradeIntent
 from ..trading.settlement import SettlementEngine, build_settlement_summary
+from .events import EventWatcher
 from .state import RuntimeState
 
 logger = logging.getLogger(__name__)
@@ -41,6 +44,8 @@ _CLOSED_POLL_SECONDS = 300
 _DECISION_ERROR_BACKOFF = 120
 # 当日结算缺价重试的截止时刻（此后留给次日补结算）
 _SETTLE_RETRY_DEADLINE = time(hour=22, minute=0)
+# 建议语义解析的最小间隔（秒）
+_SEMANTIC_PARSE_INTERVAL = 900
 
 
 class StockScheduler:
@@ -60,11 +65,17 @@ class StockScheduler:
         reporting: ReportingService,
         state: RuntimeState,
         config_provider: Callable[[], Any],
+        research: Optional[ResearchNotes] = None,
+        semantic: Optional[SuggestionAnalyzer] = None,
+        event_watcher: Optional[EventWatcher] = None,
     ) -> None:
         """初始化调度器。
 
         Args:
             config_provider: 返回当前 MaiStockSimConfig 的回调（每轮循环调用，热更新生效）。
+            research: 股票研究档案（可选，供决策上下文与交易后记录）。
+            semantic: 群聊建议语义解析器（可选）。
+            event_watcher: 市场事件监测器（可选，事件驱动决策触发）。
         """
         self._store = store
         self._quotes = quotes
@@ -78,10 +89,14 @@ class StockScheduler:
         self._reporting = reporting
         self._state = state
         self._config = config_provider
+        self._research = research
+        self._semantic = semantic
+        self._events = event_watcher
         self._tasks: List[asyncio.Task] = []
         self._started = False
         self._decision_lock = asyncio.Lock()
         self._decision_in_flight = False
+        self._last_semantic_parse = 0.0
 
     @property
     def decision_in_flight(self) -> bool:
@@ -156,6 +171,39 @@ class StockScheduler:
             await self._quotes.fetch(symbols[:40], cross_validate=False)
         except Exception as exc:
             logger.warning("行情刷新失败: %s", exc)
+        await self._check_market_events([item["symbol"] for item in self._store.get_positions()]
+                                        + [item["symbol"] for item in self._store.get_watchlist()])
+
+    async def _check_market_events(self, symbols: List[str]) -> None:
+        """事件驱动观察：程序判定重要性后触发一次额外的麦麦分析。"""
+        if self._events is None or not self._config().events.event_trigger_enabled:
+            return
+        if not self._state.plugin_enabled or not self._state.auto_trade_enabled:
+            return
+        phase = self._calendar.phase_at()
+        if phase.phase not in (SessionPhase.MORNING_SESSION, SessionPhase.AFTERNOON_SESSION):
+            return
+        focus = list(dict.fromkeys(symbols))[:20]
+        try:
+            events = self._events.detect(focus)
+        except Exception as exc:
+            logger.warning("市场事件检测异常: %s", exc)
+            return
+        if not events:
+            return
+        self._state.recent_market_events = [event.summary_line() for event in events[-5:]]
+        primary = events[0]
+        if not self._events.should_trigger(primary.symbol):
+            return
+        config = self._config()
+        min_gap = config.decision.min_decision_interval_minutes * 60
+        if time_module.monotonic() - self._state.last_decision_at < min_gap:
+            return
+        logger.info("市场事件触发额外分析: %s", self._state.recent_market_events)
+        try:
+            await self.run_decision_cycle()
+        except Exception as exc:
+            logger.warning("事件触发决策异常: %s", exc)
 
     # ── 周期决策 ──────────────────────────────────────────────
 
@@ -217,6 +265,20 @@ class StockScheduler:
                     logger.warning("决策周期 %s 已在执行或已执行过，跳过", run_key)
                     return False
 
+                # 决策前：轻量语义解析积压的群聊建议（限频，批量）
+                await self._parse_suggestions(config)
+
+                # 追加上下文：研究档案 + 最近市场事件
+                extra: Dict[str, str] = {}
+                if self._research is not None and config.decision.research_notes_enabled:
+                    focus = [item["symbol"] for item in self._store.get_positions()]
+                    focus += [item["symbol"] for item in self._store.get_watchlist()]
+                    extra["research"] = self._research.summary(list(dict.fromkeys(focus)) or None)
+                if self._state.recent_market_events:
+                    extra["market_events"] = "\n".join(
+                        ["程序检测到以下市场异动："] + self._state.recent_market_events
+                    )
+
                 # 人格设定
                 personality = await self._decision.fetch_personality(self._personality_capability)
                 result = await self._decision.run_decision(
@@ -227,6 +289,7 @@ class StockScheduler:
                     max_tokens_per_day=config.decision.max_tokens_per_day,
                     max_output_tokens=config.decision.max_output_tokens,
                     candidates_limit=config.decision.candidate_pool_size,
+                    extra_context=extra or None,
                 )
                 self._state.last_decision_at = time_module.monotonic()
                 if not result.success or result.output is None:
@@ -291,6 +354,10 @@ class StockScheduler:
                             item.reason,
                             f"decision:{result.decision_id}",
                         )
+                        if self._research is not None and config.decision.research_notes_enabled:
+                            self._research.record_watch(
+                                item.symbol, self._store.stock_name(item.symbol), item.reason
+                            )
 
                 # 记录建议消费
                 suggestions = self._store.fresh_suggestions(limit=config.chat.max_suggestions_in_context)
@@ -301,14 +368,28 @@ class StockScheduler:
                 # 记忆与播报
                 for report in reports:
                     if report.status == "filled":
+                        name = self._store.stock_name(report.intent.symbol)
                         self._memory.record_trade_outcome(
                             report.intent.symbol,
-                            self._store.stock_name(report.intent.symbol),
+                            name,
                             report.intent.side,
                             report.qty,
                             report.price,
                             report.intent.reason,
                         )
+                        if self._research is not None and config.decision.research_notes_enabled:
+                            if report.intent.side == "BUY":
+                                self._research.record_buy(
+                                    report.intent.symbol, name, report.qty, report.price, report.intent.reason
+                                )
+                            else:
+                                self._research.record_sell(
+                                    report.intent.symbol, name, report.qty, report.price, report.intent.reason
+                                )
+                                if self._store.get_position(report.intent.symbol) is None:
+                                    self._research.record_give_up(
+                                        report.intent.symbol, f"已清仓：{report.intent.reason}"
+                                    )
                 self._reporting.announce_trades(
                     self._ctx,
                     self._state.broadcast_stream_ids,
@@ -319,6 +400,45 @@ class StockScheduler:
                 return True
             finally:
                 self._decision_in_flight = False
+
+    async def _parse_suggestions(self, config) -> None:
+        """决策前的建议语义解析（限频批量）与可选的主动追问。"""
+        if self._semantic is None or not config.chat.semantic_enabled:
+            return
+        if time_module.monotonic() - self._last_semantic_parse < _SEMANTIC_PARSE_INTERVAL:
+            return
+        if not self._store.suggestions_to_parse(limit=1):
+            return
+        self._last_semantic_parse = time_module.monotonic()
+        labeled = await self._semantic.parse_pending(config.decision.model_name)
+        if labeled:
+            logger.info("建议语义解析完成：%d 条", labeled)
+        await self._maybe_ask_clarification(config)
+
+    async def _maybe_ask_clarification(self, config) -> None:
+        """对看不透的群友建议主动追问（每天最多 2 次，走播报节流）。"""
+        if not config.chat.ask_back_enabled:
+            return
+        if self._store.count_deliveries_today("ask") >= 2:
+            return
+        target = SuggestionAnalyzer.pick_clarification_target(self._store.fresh_suggestions(limit=15))
+        if target is None:
+            return
+        stream_id = str(target.get("stream_id") or "")
+        if not stream_id or not hasattr(self, "_ctx"):
+            return
+        question = SuggestionAnalyzer.build_question(target)
+        self._store.mark_suggestion_asked(int(target["id"]))
+        self._reporting.spawn(
+            self._reporting.deliver(
+                self._ctx,
+                stream_id,
+                f"ask:{target['id']}",
+                question,
+                "你在研究群友提到的股票，但没太看懂其中一条观点，去自然地问一下那位群友具体的意思（一两句话，说明是虚拟模拟盘研究）",
+                f"【麦麦模拟盘·想请教】{question}",
+            )
+        )
 
     def bind_host(self, ctx, personality_capability) -> None:
         """绑定宿主上下文（播报与人格读取用）。"""
@@ -368,6 +488,8 @@ class StockScheduler:
                 ):
                     if self._store.try_begin_run(f"settle:{today}"):
                         try:
+                            # 结算前处理已到除权除息日的分红送转（入当日权益）
+                            await self._auto_corporate_actions()
                             outcome = await self.run_settlement_with_report()
                             if outcome.get("deferred"):
                                 self._store.finish_run(
@@ -381,6 +503,7 @@ class StockScheduler:
                             else:
                                 self._store.finish_run(f"settle:{today}", "done")
                                 last_settle_day = today
+                                await self._update_index_bars()
                         except Exception as exc:
                             self._store.finish_run(f"settle:{today}", "failed", str(exc))
                             last_settle_day = today
@@ -442,6 +565,46 @@ class StockScheduler:
             except Exception as exc:
                 self._store.finish_run(f"settle:{day}", "failed", str(exc))
                 logger.warning("补结算 %s 失败: %s", day, exc)
+
+    async def _auto_corporate_actions(self) -> None:
+        """自动处理持仓股票已到除权除息日的分红送转（配置开关控制）。"""
+        if not self._state.corporate_actions_auto:
+            return
+        symbols = [item["symbol"] for item in self._store.get_positions()]
+        if not symbols:
+            return
+        try:
+            results = await self._corporate.auto_process(
+                symbols, lambda symbol: self._quotes.peek_cached_price(symbol)
+            )
+        except Exception as exc:
+            logger.warning("分红送转自动处理异常: %s", exc)
+            return
+        for item in results:
+            if item.get("action") == "applied":
+                logger.info(
+                    "分红送转入账 %s（%s）: 每股派现 %s，送转比例 %s",
+                    item["symbol"], item["ex_date"], item.get("cash_per_share"), item.get("share_ratio"),
+                )
+            elif item.get("action") == "pending_review":
+                logger.warning("分红送转待人工核实 %s: %s", item["symbol"], item.get("detail"))
+
+    async def _update_index_bars(self) -> None:
+        """更新沪深 300 指数日线缓存（收益对比基准，失败不影响主流程）。"""
+        if not self._config().data_source.akshare_enabled:
+            return
+        try:
+            from ..market.akshare_provider import fetch_index_daily
+
+            rows = await asyncio.to_thread(fetch_index_daily, "sh000300", 120)
+        except Exception as exc:
+            logger.debug("指数日线更新失败（基准对比暂不可用）: %s", exc)
+            return
+        if not rows:
+            return
+        from ..trading.analytics import INDEX_SYMBOL
+
+        self._store.upsert_index_bars(INDEX_SYMBOL, rows)
 
     async def catch_up_after_restart(self) -> None:
         """宿主/插件重启后的恢复：补结算（只补数据，不追补交易）。"""

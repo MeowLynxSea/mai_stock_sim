@@ -22,7 +22,7 @@ from ..market.symbols import exchange_and_board
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA_STATEMENTS = [
     """
@@ -249,7 +249,29 @@ _SCHEMA_STATEMENTS = [
         PRIMARY KEY (event_key, stream_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS stock_notes (
+        symbol TEXT PRIMARY KEY,
+        name TEXT,
+        status TEXT NOT NULL DEFAULT 'watching',
+        thesis TEXT,
+        concerns TEXT,
+        events_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
 ]
+
+# 旧库补列（已有表通过 PRAGMA 检测后 ALTER，幂等）
+_COLUMN_MIGRATIONS: Dict[str, Dict[str, str]] = {
+    "suggestions": {
+        "stance_confidence": "REAL",
+        "stance_basis": "TEXT",
+        "parsed": "INTEGER NOT NULL DEFAULT 0",
+        "asked_clarification": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
 
 
 @dataclass
@@ -322,6 +344,11 @@ class AccountStore:
             applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
             for statement in _SCHEMA_STATEMENTS:
                 conn.execute(statement)
+            for table, columns in _COLUMN_MIGRATIONS.items():
+                existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                for column, ddl in columns.items():
+                    if column not in existing:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
             if SCHEMA_VERSION not in applied:
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
@@ -679,6 +706,14 @@ class AccountStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def applied_corporate_action_dates(self, symbol: str, action_type: str) -> set:
+        """某股票某类公司行为已生效的交易日集合（幂等去重用）。"""
+        rows = self.connection().execute(
+            "SELECT trade_date FROM corporate_actions WHERE symbol = ? AND action_type = ? AND status = 'applied'",
+            (symbol, action_type),
+        ).fetchall()
+        return {str(row["trade_date"]) for row in rows}
+
     def record_corporate_action(self, symbol: str, action_type: str, trade_date: str, payload: Dict[str, Any]) -> None:
         """登记一条待处理公司行为（不自动改账）。"""
         conn = self.connection()
@@ -712,6 +747,50 @@ class AccountStore:
                 raise
 
     # ── 管理员重置（账户管理操作，非市场交易） ─────────────────
+
+    @staticmethod
+    def adjust_shares_in_conn(conn: sqlite3.Connection, symbol: str, ratio: float) -> Dict[str, Any]:
+        """在既有事务内按送转比例调整持股（公司行为专用）。
+
+        ratio = 每 10 股送转合计 / 10（如 10 送 3 转 2 → 0.5）。
+        数量按各批次比例向下取整，尾差补到最近批次，保证总数一致；
+        总成本不变（avg_cost 相应摊薄）。
+        """
+        row = conn.execute("SELECT qty, avg_cost FROM positions WHERE symbol = ?", (symbol,)).fetchone()
+        if row is None or int(row["qty"]) <= 0:
+            raise ValueError(f"{symbol} 无持仓，无法执行送转调整")
+        old_qty = int(row["qty"])
+        new_qty_total = int(old_qty * (1.0 + ratio))
+        lots = conn.execute(
+            "SELECT id, qty FROM position_lots WHERE symbol = ? ORDER BY trade_date, id", (symbol,)
+        ).fetchall()
+        scaled_total = 0
+        updates: List[tuple] = []
+        for lot in lots:
+            lot_qty = int(lot["qty"])
+            if lot_qty <= 0:
+                continue
+            scaled = int(lot_qty * (1.0 + ratio))
+            scaled_total += scaled
+            updates.append((scaled, int(lot["id"])))
+        if updates:
+            # 尾差补到最近批次
+            remainder = new_qty_total - scaled_total
+            last_id = updates[-1][0]
+            updates[-1] = (last_id + remainder, updates[-1][1])
+            for qty, lot_id in updates:
+                conn.execute("UPDATE position_lots SET qty = ? WHERE id = ?", (qty, lot_id))
+        new_avg = round(old_qty * float(row["avg_cost"]) / new_qty_total, 6) if new_qty_total else 0.0
+        conn.execute(
+            "UPDATE positions SET qty = ?, avg_cost = ?, updated_at = ? WHERE symbol = ?",
+            (new_qty_total, new_avg, now_sh().isoformat(), symbol),
+        )
+        return {
+            "old_qty": old_qty,
+            "new_qty": new_qty_total,
+            "bonus_qty": new_qty_total - old_qty,
+            "avg_cost": new_avg,
+        }
 
     def admin_reset(
         self,
@@ -933,6 +1012,30 @@ class AccountStore:
             )
             conn.commit()
 
+    def upsert_index_bars(self, symbol: str, rows: Sequence[Dict[str, Any]]) -> None:
+        """写入指数日线缓存（收益对比基准，幂等）。"""
+        if not rows:
+            return
+        conn = self.connection()
+        with self._write_lock:
+            conn.executemany(
+                "INSERT OR REPLACE INTO daily_bars(symbol, trade_date, open, high, low, close, volume, amount, pct_chg) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 0.0)",
+                [
+                    (
+                        symbol,
+                        str(row["date"]),
+                        float(row["open"]),
+                        float(row["high"]),
+                        float(row["low"]),
+                        float(row["close"]),
+                        float(row["volume"]),
+                    )
+                    for row in rows
+                ],
+            )
+            conn.commit()
+
     def remove_watchlist(self, symbol: str) -> bool:
         """移除观察项。"""
         conn = self.connection()
@@ -1051,6 +1154,143 @@ class AccountStore:
             )
             conn.commit()
             return cursor.rowcount or 0
+
+    def suggestions_to_parse(self, limit: int = 8) -> List[Dict[str, Any]]:
+        """读取待语义解析的建议（未过期、未被解析过，按时间正序）。"""
+        now = now_sh().isoformat()
+        rows = self.connection().execute(
+            "SELECT * FROM suggestions WHERE expires_at > ? AND parsed = 0 "
+            "ORDER BY created_at LIMIT ?",
+            (now, int(limit)),
+        ).fetchall()
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["symbols"] = json.loads(item.get("symbols_json") or "[]")
+            results.append(item)
+        return results
+
+    def update_suggestion_stance(self, suggestion_id: int, stance: str, confidence: float, basis: str) -> None:
+        """写入语义解析结果（观点/置信度/依据）。"""
+        conn = self.connection()
+        with self._write_lock:
+            conn.execute(
+                "UPDATE suggestions SET stance = ?, stance_confidence = ?, stance_basis = ?, parsed = 1 WHERE id = ?",
+                (stance, float(confidence), str(basis)[:200], int(suggestion_id)),
+            )
+            conn.commit()
+
+    def mark_suggestion_asked(self, suggestion_id: int) -> None:
+        """标记建议已向群友追问过（避免重复追问）。"""
+        conn = self.connection()
+        with self._write_lock:
+            conn.execute(
+                "UPDATE suggestions SET asked_clarification = 1 WHERE id = ?", (int(suggestion_id),)
+            )
+            conn.commit()
+
+    # ── 股票研究档案 ──────────────────────────────────────────
+
+    def get_stock_note(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """读取单只股票的研究档案。"""
+        row = self.connection().execute(
+            "SELECT * FROM stock_notes WHERE symbol = ?", (symbol,)
+        ).fetchone()
+        if row is None:
+            return None
+        note = dict(row)
+        note["events"] = json.loads(note.get("events_json") or "[]")
+        return note
+
+    def upsert_stock_note(
+        self,
+        symbol: str,
+        name: str = "",
+        status: Optional[str] = None,
+        thesis: Optional[str] = None,
+        concerns: Optional[str] = None,
+    ) -> None:
+        """创建或部分更新研究档案（空值字段不覆盖）。"""
+        conn = self.connection()
+        now = now_sh().isoformat()
+        with self._write_lock:
+            existing = conn.execute(
+                "SELECT symbol FROM stock_notes WHERE symbol = ?", (symbol,)
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO stock_notes(symbol, name, status, thesis, concerns, events_json, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, '[]', ?, ?)",
+                    (symbol, name, status or "watching", thesis or "", concerns or "", now, now),
+                )
+            else:
+                conn.execute(
+                    "UPDATE stock_notes SET name = CASE WHEN ? != '' THEN ? ELSE name END, "
+                    "status = COALESCE(?, status), thesis = COALESCE(?, thesis), "
+                    "concerns = COALESCE(?, concerns), updated_at = ? WHERE symbol = ?",
+                    (name, name, status, thesis, concerns, now, symbol),
+                )
+            conn.commit()
+
+    def append_note_event(self, symbol: str, kind: str, detail: str) -> None:
+        """向研究档案追加一条时间线事件（关注/买入/卖出/放弃/改观）。"""
+        conn = self.connection()
+        now = now_sh().isoformat()
+        with self._write_lock:
+            row = conn.execute(
+                "SELECT events_json FROM stock_notes WHERE symbol = ?", (symbol,)
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                events = json.loads(row["events_json"] or "[]")
+            except json.JSONDecodeError:
+                events = []
+            events.append({"date": today_sh().isoformat(), "kind": kind, "detail": str(detail)[:200]})
+            conn.execute(
+                "UPDATE stock_notes SET events_json = ?, updated_at = ? WHERE symbol = ?",
+                (json.dumps(events[-30:], ensure_ascii=False), now, symbol),
+            )
+            conn.commit()
+
+    def stock_notes_rows(self, symbols: Sequence[str] = (), limit: int = 12) -> List[Dict[str, Any]]:
+        """研究档案列表（优先给定符号，否则按更新时间倒序）。"""
+        if symbols:
+            placeholders = ",".join("?" for _ in symbols)
+            rows = self.connection().execute(
+                f"SELECT * FROM stock_notes WHERE symbol IN ({placeholders}) ORDER BY updated_at DESC LIMIT ?",
+                (*symbols, int(limit)),
+            ).fetchall()
+        else:
+            rows = self.connection().execute(
+                "SELECT * FROM stock_notes ORDER BY updated_at DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            note = dict(row)
+            note["events"] = json.loads(note.get("events_json") or "[]")
+            results.append(note)
+        return results
+
+    # ── 调度与投递计数 ────────────────────────────────────────
+
+    def count_runs_today(self, prefix: str) -> int:
+        """当日以某前缀开始的调度运行数（事件触发限频用）。"""
+        today = today_sh().strftime("%Y%m%d")
+        row = self.connection().execute(
+            "SELECT COUNT(*) FROM scheduler_runs WHERE run_key LIKE ?",
+            (f"{prefix}:{today}%",),
+        ).fetchone()
+        return int(row[0])
+
+    def count_deliveries_today(self, prefix: str) -> int:
+        """当日以某前缀开始的播报投递数（追问限频用）。"""
+        day_start = today_sh().isoformat()
+        row = self.connection().execute(
+            "SELECT COUNT(*) FROM broadcast_deliveries WHERE event_key LIKE ? AND updated_at >= ?",
+            (f"{prefix}:%", day_start),
+        ).fetchone()
+        return int(row[0])
 
     # ── 风控与调度记录 ────────────────────────────────────────
 

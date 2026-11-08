@@ -6,7 +6,7 @@ from typing import Any, ClassVar, Dict, List, Literal
 
 from maibot_sdk import Field, PluginConfigBase
 
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 
 
 class PluginSection(PluginConfigBase):
@@ -366,6 +366,67 @@ class DecisionSection(PluginConfigBase):
         description="允许麦麦自主更新观察列表。",
         json_schema_extra={"label": "允许自主更新观察列表", "order": 9},
     )
+    research_notes_enabled: bool = Field(
+        default=True,
+        description=(
+            "维护每只股票的长期研究档案（最初为何关注、看好什么、担心什么、"
+            "哪些事件改变了判断、何时放弃），决策时随上下文携带。"
+        ),
+        json_schema_extra={"label": "股票研究档案", "order": 10},
+    )
+
+
+class EventsSection(PluginConfigBase):
+    """[events] 事件驱动的主动观察。"""
+
+    __ui_label__: ClassVar[str] = "事件观察"
+    __ui_icon__: ClassVar[str] = "zap"
+    __ui_order__: ClassVar[int] = 6
+
+    event_trigger_enabled: bool = Field(
+        default=True,
+        description=(
+            "持仓/观察股票出现重要事件（快速涨跌、接近涨跌停、跳空、异常放量、"
+            "突破关键价位）时，提前触发一次麦麦的分析（不要求交易）。"
+            "先由程序按阈值判定重要性，通过才调用模型，控制 Token 消耗。"
+        ),
+        json_schema_extra={"label": "启用事件触发分析", "order": 1},
+    )
+    event_move_threshold_pct: float = Field(
+        default=7.0,
+        ge=1.0,
+        le=29.0,
+        description="快速波动阈值（当日涨跌幅绝对值 %）。",
+        json_schema_extra={"label": "快速波动阈值(%)", "order": 2},
+    )
+    event_gap_threshold_pct: float = Field(
+        default=3.0,
+        ge=0.5,
+        le=15.0,
+        description="跳空阈值（开盘价相对昨收 %）。",
+        json_schema_extra={"label": "跳空阈值(%)", "order": 3},
+    )
+    event_volume_spike_ratio: float = Field(
+        default=3.0,
+        ge=1.5,
+        le=20.0,
+        description="放量倍数（按已交易时间折算全天量 / 20 日均量）。",
+        json_schema_extra={"label": "放量倍数", "order": 4},
+    )
+    event_max_per_day: int = Field(
+        default=6,
+        ge=1,
+        le=30,
+        description="每日事件触发的分析次数上限。",
+        json_schema_extra={"label": "每日触发上限", "order": 5},
+    )
+    event_cooldown_minutes: int = Field(
+        default=60,
+        ge=5,
+        le=480,
+        description="同一股票两次事件触发之间的冷却时间（分钟）。",
+        json_schema_extra={"label": "同股冷却(分钟)", "order": 6},
+    )
 
 
 class ChatSection(PluginConfigBase):
@@ -415,6 +476,22 @@ class ChatSection(PluginConfigBase):
         le=50,
         description="每轮决策上下文携带的最大建议条数。",
         json_schema_extra={"label": "上下文建议上限", "order": 5},
+    )
+    semantic_enabled: bool = Field(
+        default=True,
+        description=(
+            "对识别出的群聊建议做轻量语义识别（批量提取观点/置信度/依据，"
+            "每批最多 8 条、一轮决策前最多一次模型调用）。关闭则只按原文进入决策上下文。"
+        ),
+        json_schema_extra={"label": "建议语义识别", "hint": "用轻量模型调用提取群友观点与依据", "order": 6},
+    )
+    ask_back_enabled: bool = Field(
+        default=True,
+        description=(
+            "允许麦麦对看不懂/把握不大的群友建议主动追问（每天最多 2 次，"
+            "静默时段不追问）。追问只是聊天，不产生任何交易动作。"
+        ),
+        json_schema_extra={"label": "允许主动追问群友", "order": 7},
     )
 
 
@@ -484,7 +561,7 @@ class AdvancedSection(PluginConfigBase):
 
     __ui_label__: ClassVar[str] = "高级"
     __ui_icon__: ClassVar[str] = "sliders"
-    __ui_order__: ClassVar[int] = 6
+    __ui_order__: ClassVar[int] = 7
 
     settlement_time: str = Field(
         default="15:10",
@@ -516,7 +593,16 @@ class AdvancedSection(PluginConfigBase):
     log_level: str = Field(
         default="INFO",
         description="插件日志级别（DEBUG/INFO/WARNING/ERROR）。",
-        json_schema_extra={"label": "日志级别", "order": 6},
+        json_schema_extra={"label": "日志级别", "order": 7},
+    )
+    corporate_actions_auto: bool = Field(
+        default=True,
+        description=(
+            "自动处理分红送转（东方财富数据源）：除权除息日到达自动入账"
+            "（现金分红入现金、送转股调整持仓），来源与结果全程审计；"
+            "数据异常时登记待处理并暂停该股新增买入，转人工核实。"
+        ),
+        json_schema_extra={"label": "分红送转自动处理", "order": 6},
     )
 
 
@@ -528,5 +614,6 @@ class MaiStockSimConfig(PluginConfigBase):
     trade: TradeSection = Field(default_factory=TradeSection)
     decision: DecisionSection = Field(default_factory=DecisionSection)
     chat: ChatSection = Field(default_factory=ChatSection)
+    events: EventsSection = Field(default_factory=EventsSection)
     data_source: DataSourceSection = Field(default_factory=DataSourceSection)
     advanced: AdvancedSection = Field(default_factory=AdvancedSection)

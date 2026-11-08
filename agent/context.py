@@ -71,12 +71,18 @@ class DecisionContextBuilder:
         self._pool = pool_builder
         self._risk_params_provider = risk_params_provider
 
-    async def build(self, personality_text: str, candidates_limit: int = 25) -> Dict[str, str]:
+    async def build(
+        self,
+        personality_text: str,
+        candidates_limit: int = 25,
+        extra: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
         """构建决策输入字典。
 
         Args:
             personality_text: 麦麦当前人格设定文本。
             candidates_limit: 候选池摘要上限。
+            extra: 追加上下文（研究档案/市场事件等），覆盖同名默认占位。
 
         Returns:
             Dict[str, str]: 键值型上下文（写入 decision_inputs 审计）。
@@ -135,13 +141,13 @@ class DecisionContextBuilder:
             for item in candidates
         ]
 
-        # 群友建议（不可信外部信息，仅参考）
-        suggestion_lines: List[str] = []
-        for record in self._store.fresh_suggestions(limit=15):
-            suggestion_lines.append(
-                f"- [{record['created_at'][:16]}] {record['user_name'] or '群友'}: {record['text'][:80]}"
-                + (f"（涉及: {', '.join(record['symbols'])}）" if record.get("symbols") else "")
-            )
+        # 群友建议（不可信外部信息，仅参考；已解析的附带观点标签）
+        from ..social.semantic import render_suggestion_line
+
+        suggestion_lines: List[str] = [
+            render_suggestion_line(record)
+            for record in self._store.fresh_suggestions(limit=15)
+        ]
 
         # 近期风控拒绝记录（告诉麦麦上一轮为什么没买成）
         risk_lines = [
@@ -155,16 +161,21 @@ class DecisionContextBuilder:
             for row in self._store.equity_history(limit=7)
         ]
 
-        return {
+        context = {
             "personality": personality_text,
             "account": "\n".join(account_lines),
             "watchlist": "\n".join(watch_lines) or "（空）",
+            "research": "（麦麦还没有建立研究档案）",
             "candidates": "\n".join(candidate_lines) or "（候选池为空）",
             "suggestions": "\n".join(suggestion_lines) or "（暂无群友讨论）",
+            "market_events": "（无异常事件）",
             "risk_events": "\n".join(risk_lines) or "（今日无风控拒绝记录）",
             "equity_history": "\n".join(equity_lines) or "（暂无结算记录）",
             "memory": self._memory.summary(),
         }
+        if extra:
+            context.update(extra)
+        return context
 
     def _load_history(self, symbol: str, limit: int):
         """读取缓存 K 线。"""

@@ -29,14 +29,20 @@ class RuntimeState:
     suggestion_stream_mode: str = "allowlist"
     allowed_suggestion_streams: Set[str] = field(default_factory=set)
     suggestion_ttl_hours: int = 24
+    semantic_enabled: bool = True
+    ask_back_enabled: bool = True
     use_strategy_memory: bool = True
     allow_watchlist_update: bool = True
+    research_notes_enabled: bool = True
     decision_model_name: str = ""
     budget_enabled: bool = False
+    corporate_actions_auto: bool = True
     last_decision_at: float = 0.0
     # 决策动态间隔：模型可通过 next_review_minutes 影响（受上下限约束）
     next_decision_delay_minutes: Optional[float] = None
     calendar_degraded_notified: bool = False
+    # 事件驱动观察：最近检测到的市场事件（供决策上下文携带）
+    recent_market_events: List[str] = field(default_factory=list)
 
     def apply_config(self, config: MaiStockSimConfig) -> None:
         """把配置映射到运行时状态。"""
@@ -48,10 +54,14 @@ class RuntimeState:
         self.suggestion_stream_mode = str(config.chat.suggestion_stream_mode)
         self.allowed_suggestion_streams = set(config.chat.allowed_stream_ids)
         self.suggestion_ttl_hours = int(config.chat.suggestion_ttl_hours)
+        self.semantic_enabled = bool(config.chat.semantic_enabled)
+        self.ask_back_enabled = bool(config.chat.ask_back_enabled)
         self.use_strategy_memory = bool(config.decision.use_strategy_memory)
         self.allow_watchlist_update = bool(config.decision.allow_watchlist_update)
+        self.research_notes_enabled = bool(config.decision.research_notes_enabled)
         self.decision_model_name = str(config.decision.model_name or "")
         self.budget_enabled = bool(config.decision.budget_enabled)
+        self.corporate_actions_auto = bool(config.advanced.corporate_actions_auto)
 
     def stream_access(self) -> Tuple[str, Set[str]]:
         """返回建议监听的（模式, 聊天流集合）。"""
@@ -93,6 +103,20 @@ def build_broadcast_policy(config: MaiStockSimConfig) -> BroadcastPolicy:
         daily_max=config.general.broadcast_daily_max,
         quiet_start=quiet_start,
         quiet_end=quiet_end,
+    )
+
+
+def build_event_policy(config: MaiStockSimConfig):
+    """从配置构造事件观察策略。"""
+    from .events import EventPolicy
+
+    return EventPolicy(
+        enabled=config.events.event_trigger_enabled,
+        move_threshold_pct=config.events.event_move_threshold_pct,
+        gap_threshold_pct=config.events.event_gap_threshold_pct,
+        volume_spike_ratio=config.events.event_volume_spike_ratio,
+        max_triggers_per_day=config.events.event_max_per_day,
+        cooldown_minutes=config.events.event_cooldown_minutes,
     )
 
 

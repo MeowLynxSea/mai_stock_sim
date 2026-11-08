@@ -119,3 +119,79 @@ def fetch_spot_snapshot() -> List[Dict[str, object]]:
             }
         )
     return records
+
+
+def fetch_dividend_plans(symbol: str) -> List[Dict[str, object]]:
+    """获取某股票的分红送配方案（东方财富源）。
+
+    Returns:
+        List[Dict[str, object]]: 已实施的分配方案，每条包含：
+        ex_date（除权除息日）/ record_date（股权登记日）/ cash_per_share（每股派现，税前，元）/
+        bonus_per_share（每股送股）/ transfer_per_share（每股转增）/ report_date（报告期）。
+        仅返回「实施分配」且除权除息日有效的方案。
+    """
+    ak = _require_akshare()
+    code = normalize_symbol(symbol)
+    if code is None:
+        raise ValueError(f"非法股票代码: {symbol!r}")
+    frame = ak.stock_fhps_detail_em(symbol=code)
+
+    def _per_share_10(key: str) -> float:
+        raw_value = row.get(key)
+        try:
+            value = float(raw_value)
+            if value != value:  # NaN
+                return 0.0
+            return value / 10.0  # 接口口径为每 10 股
+        except (TypeError, ValueError):
+            return 0.0
+
+    plans: List[Dict[str, object]] = []
+    for _, row in frame.iterrows():
+        if str(row.get("方案进度", "")).strip() != "实施分配":
+            continue
+        ex_date = row.get("除权除息日")
+        ex_date_text = "" if ex_date is None or str(ex_date) == "NaT" else str(ex_date)
+        if not ex_date_text:
+            continue
+        record_date = row.get("股权登记日")
+        plans.append(
+            {
+                "symbol": code,
+                "ex_date": ex_date_text[:10],
+                "record_date": "" if record_date is None or str(record_date) == "NaT" else str(record_date)[:10],
+                "cash_per_share": round(_per_share_10("现金分红-现金分红比例"), 6),
+                "bonus_per_share": round(_per_share_10("送转股份-送股比例"), 6),
+                "transfer_per_share": round(_per_share_10("送转股份-转股比例"), 6),
+                "report_date": str(row.get("报告期", ""))[:10],
+            }
+        )
+    return plans
+
+
+def fetch_index_daily(symbol: str, days: int = 120) -> List[Dict[str, object]]:
+    """获取指数日线（基准对比用，如 sh000300 = 沪深 300）。
+
+    Returns:
+        List[Dict[str, object]]: 升序列表，每条含 date/open/close/high/low/volume。
+    """
+    ak = _require_akshare()
+    from datetime import date as date_module
+    from datetime import timedelta
+
+    end = date_module.today()
+    start = end - timedelta(days=days)
+    frame = ak.stock_zh_index_daily_em(
+        symbol=symbol, start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d")
+    )
+    return [
+        {
+            "date": str(row["date"]),
+            "open": float(row["open"]),
+            "close": float(row["close"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "volume": float(row["volume"]),
+        }
+        for _, row in frame.iterrows()
+    ]

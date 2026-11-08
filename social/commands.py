@@ -291,7 +291,7 @@ class StockCommandMixin:
         return "\n".join(lines)
 
     def _build_review_text(self, store) -> str:
-        """复盘信息。"""
+        """复盘信息（近期结算 + 收益统计）。"""
         history = store.equity_history(limit=7)
         if not history:
             return "还没有结算记录（等麦麦完成第一个交易日）。"
@@ -303,6 +303,13 @@ class StockCommandMixin:
             )
         total = store.total_realized_pnl()
         lines.append(f"累计已实现盈亏：{total:+,.2f} 元")
+        analytics = getattr(self, "analytics", None)
+        if analytics is not None:
+            stats_text = analytics.summary_text()
+            if stats_text:
+                lines.append("")
+                lines.append("【收益统计】")
+                lines.append(stats_text)
         return "\n".join(lines)
 
 

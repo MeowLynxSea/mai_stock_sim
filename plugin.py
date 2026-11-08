@@ -22,24 +22,29 @@ from maibot_sdk.types import ErrorPolicy, EventType, HookMode, HookOrder
 
 from .agent.context import DecisionContextBuilder
 from .agent.decision import DecisionEngine
+from .agent.research import ResearchNotes
 from .agent.stock_selection import CandidatePoolBuilder
 from .agent.strategy_memory import StrategyMemory
 from .config import MaiStockSimConfig, resolve_trade_params
 from .market.calendar import TradeCalendar
 from .market.quotes import QuoteService
+from .runtime.events import EventWatcher
 from .runtime.scheduler import StockScheduler
 from .runtime.state import (
     RuntimeState,
     apply_runtime_settings,
     build_broadcast_policy,
+    build_event_policy,
     build_fee_model,
     build_risk_params,
 )
 from .social.commands import StockCommandMixin
 from .social.influence import SuggestionInfluence, extract_message_fields
 from .social.reporting import BroadcastGate, ReportingService
+from .social.semantic import SuggestionAnalyzer
 from .social.tools import StockToolMixin
 from .trading.account import AccountStore
+from .trading.analytics import PerformanceAnalytics
 from .trading.corporate_actions import CorporateActionGuard
 from .trading.execution import ExecutionEngine
 from .trading.risk import RiskManager
@@ -61,6 +66,7 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
         self.calendar: Optional[TradeCalendar] = None
         self.scheduler: Optional[StockScheduler] = None
         self.influence: Optional[SuggestionInfluence] = None
+        self.analytics: Optional[PerformanceAnalytics] = None
         self._state: Optional[RuntimeState] = None
         self._config_snapshot: Optional[MaiStockSimConfig] = None
         self._broadcast_gate: Optional[BroadcastGate] = None
@@ -108,6 +114,10 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
         )
         memory = StrategyMemory(self.store)
         pool_builder = CandidatePoolBuilder(self.store)
+        research = ResearchNotes(self.store)
+        semantic = SuggestionAnalyzer(self.store, self._call_llm)
+        event_watcher = EventWatcher(self.store, self.quotes, self.calendar)
+        event_watcher.bind_policy(lambda: build_event_policy(self._get_config()))
         context_builder = DecisionContextBuilder(
             self.store, self.quotes, self.calendar, memory, pool_builder, lambda: self._risk.params
         )
@@ -119,6 +129,7 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
         )
         settlement = SettlementEngine(self.store, self.quotes, self.calendar)
         corporate_guard = CorporateActionGuard(self.store)
+        self.analytics = PerformanceAnalytics(self.store)
         self._reporting = ReportingService(self._broadcast_gate, self.store)
         reporting = self._reporting
 
@@ -142,6 +153,9 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
             reporting,
             self._state,
             self._get_config,
+            research=research,
+            semantic=semantic,
+            event_watcher=event_watcher,
         )
         self.scheduler.bind_host(self.ctx, self.ctx.personality)
         apply_runtime_settings(config, self._state, self.quotes, self._risk, self._execution, self._broadcast_gate)
@@ -254,12 +268,12 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
         public=True,
     )
     async def api_get_account_summary(self, **kwargs: Any) -> Dict[str, Any]:
-        """跨插件只读账户摘要。"""
+        """跨插件只读账户摘要（含收益统计总览）。"""
         del kwargs
         if self.store is None or self.quotes is None or not self.store.account_exists():
             return {"success": False, "error": "模拟盘尚未初始化"}
         snapshot = self.store.snapshot(lambda symbol: self.quotes.peek_cached_price(symbol))
-        return {
+        payload: Dict[str, Any] = {
             "success": True,
             "total_equity": round(snapshot.total_equity, 2),
             "cash": round(snapshot.cash, 2),
@@ -268,6 +282,17 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
             "position_count": len(snapshot.positions),
             "note": "虚拟资金模拟盘（只读）",
         }
+        if self.analytics is not None:
+            overview = self.analytics.overview()
+            if overview.get("initialized"):
+                payload["performance"] = {
+                    "start_date": overview["start_date"],
+                    "total_return_pct": overview["total_return_pct"],
+                    "max_drawdown_pct": overview["drawdown"]["max_drawdown_pct"],
+                    "win_rate_pct": overview["trades"]["win_rate_pct"],
+                    "benchmark_return_pct": overview["benchmark_return_pct"],
+                }
+        return payload
 
     # ── 启动事件（日志确认） ──────────────────────────────────
 

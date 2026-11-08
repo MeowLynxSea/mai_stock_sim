@@ -144,8 +144,8 @@ class ReportingService:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-    def _spawn(self, coro) -> None:
-        """后台执行并保留强引用（防 GC）。"""
+    def spawn(self, coro) -> None:
+        """后台执行并保留强引用（防 GC；外部模块也可复用）。"""
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -237,7 +237,7 @@ class ReportingService:
         filled = [report for report in reports if report.status == "filled"]
         if not filled or not stream_ids:
             return
-        self._spawn(
+        self.spawn(
             self._announce_trades_impl(ctx, stream_ids, decision_comment, filled)
         )
 
@@ -278,7 +278,7 @@ class ReportingService:
         """每日收盘汇报（后台执行）。"""
         if not stream_ids:
             return
-        self._spawn(self._announce_daily_report_impl(ctx, stream_ids, trade_date, summary_text, review_comment))
+        self.spawn(self._announce_daily_report_impl(ctx, stream_ids, trade_date, summary_text, review_comment))
 
     async def _announce_daily_report_impl(
         self,
