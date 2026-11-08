@@ -1,0 +1,9 @@
+# 运行时产物：含聊天流 ID / 用户标识 / 环境差异，不入库
+config.toml
+config_back/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
