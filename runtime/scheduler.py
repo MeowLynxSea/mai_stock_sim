@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time as time_module
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from ..agent.decision import DecisionEngine
@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 _CLOSED_POLL_SECONDS = 300
 # 决策失败后的退避（秒）
 _DECISION_ERROR_BACKOFF = 120
+# 当日结算缺价重试的截止时刻（此后留给次日补结算）
+_SETTLE_RETRY_DEADLINE = time(hour=22, minute=0)
 
 
 class StockScheduler:
@@ -312,7 +314,6 @@ class StockScheduler:
                     self._state.broadcast_stream_ids,
                     output.public_comment,
                     reports,
-                    self._store,
                 )
                 self._store.finish_run(run_key, "done", f"orders={len(intents)} filled={len(reports)}")
                 return True
@@ -356,8 +357,10 @@ class StockScheduler:
                         except Exception as exc:
                             self._store.finish_run(f"pool:{today}", "failed", str(exc))
                         last_pool_day = today
+                        # 历史 K 线已更新：补此前因缺价延迟/遗漏的结算
+                        await self._settle_backlog()
 
-                # 收盘结算 + 日报
+                # 收盘结算 + 日报（缺价时延迟，当日自动重试至 22:00）
                 if (
                     self._calendar.is_trade_date(now.date())
                     and now.time() >= settle_time
@@ -365,11 +368,22 @@ class StockScheduler:
                 ):
                     if self._store.try_begin_run(f"settle:{today}"):
                         try:
-                            await self.run_settlement_with_report()
-                            self._store.finish_run(f"settle:{today}", "done")
+                            outcome = await self.run_settlement_with_report()
+                            if outcome.get("deferred"):
+                                self._store.finish_run(
+                                    f"settle:{today}", "deferred", str(outcome.get("detail", ""))
+                                )
+                                if now.time() >= _SETTLE_RETRY_DEADLINE:
+                                    # 当日不再重试，等次日候选池更新后由补结算完成
+                                    last_settle_day = today
+                                else:
+                                    self._store.reset_run(f"settle:{today}")
+                            else:
+                                self._store.finish_run(f"settle:{today}", "done")
+                                last_settle_day = today
                         except Exception as exc:
                             self._store.finish_run(f"settle:{today}", "failed", str(exc))
-                        last_settle_day = today
+                            last_settle_day = today
 
                 await asyncio.sleep(120)
             except asyncio.CancelledError:
@@ -379,9 +393,18 @@ class StockScheduler:
                 await asyncio.sleep(300)
 
     async def run_settlement_with_report(self, trade_date: Optional[str] = None) -> Dict[str, Any]:
-        """执行结算并按配置生成日报播报。"""
+        """执行结算并按配置生成日报播报。
+
+        Returns:
+            Dict[str, Any]: 含 summary/review；缺价延迟时含 deferred=True 与 detail。
+        """
         config = self._config()
         result = await self._settlement.settle(trade_date)
+        if result.deferred:
+            return {
+                "deferred": True,
+                "detail": f"缺少可靠估值价格: {','.join(result.missing_prices)}",
+            }
         summary = build_settlement_summary(result, self._calendar)
         # 结算后更新记忆中的持仓结果
         self._memory.settle_outcomes(lambda symbol: self._quotes.peek_cached_price(symbol))
@@ -404,17 +427,25 @@ class StockScheduler:
         logger.info("结算完成 %s: 权益 %.2f", result.trade_date, result.total_equity)
         return {"summary": summary, "result": result.trade_date, "review": review_comment}
 
-    async def catch_up_after_restart(self) -> None:
-        """宿主/插件重启后的恢复：补结算（只补数据，不追补交易）。"""
-        pending = self._settlement.catch_up_settlement()
-        for day in pending:
+    async def _settle_backlog(self) -> None:
+        """补结算积压：完成此前延迟或遗漏的历史交易日结算。"""
+        for day in self._settlement.catch_up_settlement():
+            if not self._store.try_begin_run(f"settle:{day}"):
+                continue
             try:
-                if not self._store.try_begin_run(f"settle:{day}"):
-                    continue
                 result = await self._settlement.settle(day)
+                if result.deferred:
+                    self._store.finish_run(f"settle:{day}", "deferred", "补结算仍缺价格，次日再试")
+                    continue
+                self._store.finish_run(f"settle:{day}", "done")
                 logger.info("补结算 %s 完成: 权益 %.2f", day, result.total_equity)
             except Exception as exc:
+                self._store.finish_run(f"settle:{day}", "failed", str(exc))
                 logger.warning("补结算 %s 失败: %s", day, exc)
+
+    async def catch_up_after_restart(self) -> None:
+        """宿主/插件重启后的恢复：补结算（只补数据，不追补交易）。"""
+        await self._settle_backlog()
         # 交易日历刷新
         self._calendar.load_or_refresh()
 

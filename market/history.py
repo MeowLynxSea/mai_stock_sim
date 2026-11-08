@@ -160,6 +160,15 @@ def compute_indicators(bars: List[DailyBar]) -> dict[str, object]:
     ma60 = _ma(60)
     high_20 = max((bar.high for bar in bars[-20:]), default=latest_close)
     low_20 = min((bar.low for bar in bars[-20:]), default=latest_close)
+
+    def _vol_ratio() -> Optional[float]:
+        volumes = [bar.volume for bar in bars if bar.volume and bar.volume > 0]
+        if len(volumes) < 20:
+            return None
+        avg_5 = sum(volumes[-5:]) / 5
+        avg_20 = sum(volumes[-20:]) / 20
+        return round(avg_5 / avg_20, 2) if avg_20 > 0 else None
+
     return {
         "count": len(bars),
         "close": latest_close,
@@ -174,4 +183,5 @@ def compute_indicators(bars: List[DailyBar]) -> dict[str, object]:
         "position_in_range": (
             (latest_close - low_20) / (high_20 - low_20) * 100 if high_20 > low_20 else 50.0
         ),
+        "vol_ratio": _vol_ratio(),
     }

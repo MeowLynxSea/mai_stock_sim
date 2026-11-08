@@ -13,6 +13,35 @@ from ..trading.account import AccountStore
 logger = logging.getLogger(__name__)
 
 
+def _indicator_segment(indicators: Dict[str, Any]) -> str:
+    """把技术指标渲染成候选行尾部的紧凑摘要（数据不足时为空）。"""
+    count = int(indicators.get("count") or 0)
+    if count < 6:
+        return ""
+    parts: List[str] = []
+    chg_5d = indicators.get("chg_5d")
+    if chg_5d is not None:
+        parts.append(f"5日{chg_5d:+.1f}%")
+    if count >= 21:
+        chg_20d = indicators.get("chg_20d")
+        vol20 = indicators.get("vol20")
+        ma20 = indicators.get("ma20")
+        close = indicators.get("close")
+        if chg_20d is not None:
+            parts.append(f"20日{chg_20d:+.1f}%")
+        if vol20 is not None:
+            parts.append(f"波动{vol20:.1f}%")
+        if ma20 is not None and ma20 > 0 and close is not None:
+            parts.append(f"偏离MA20{(close - ma20) / ma20 * 100:+.1f}%")
+        position = indicators.get("position_in_range")
+        if position is not None:
+            parts.append(f"区间位置{position:.0f}%")
+    vol_ratio = indicators.get("vol_ratio")
+    if vol_ratio is not None:
+        parts.append(f"量比{vol_ratio:.1f}")
+    return f"｜{' '.join(parts)}" if parts else ""
+
+
 class DecisionContextBuilder:
     """拼装一轮决策的全部输入。"""
 
@@ -101,6 +130,7 @@ class DecisionContextBuilder:
             (
                 f"- {item['name']}({item['symbol']}) [{item['board']}] 今日 {item['pct_chg'] or 0:.2f}% "
                 f"成交额 {item['turnover_yi']}亿 市值 {item['market_cap_yi']}亿"
+                f"{_indicator_segment(item.get('indicators') or {})}"
             )
             for item in candidates
         ]

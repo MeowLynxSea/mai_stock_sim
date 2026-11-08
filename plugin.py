@@ -119,7 +119,7 @@ class MaiStockSimPlugin(StockCommandMixin, StockToolMixin, MaiBotPlugin):
         )
         settlement = SettlementEngine(self.store, self.quotes, self.calendar)
         corporate_guard = CorporateActionGuard(self.store)
-        self._reporting = ReportingService(self._broadcast_gate)
+        self._reporting = ReportingService(self._broadcast_gate, self.store)
         reporting = self._reporting
 
         self.influence = SuggestionInfluence(

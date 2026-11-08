@@ -29,6 +29,7 @@ class SettlementResult:
     realized_pnl_day: float = 0.0
     positions: List[Dict[str, Any]] = field(default_factory=list)
     duplicate: bool = False  # 是否为重复结算（快照已存在）
+    deferred: bool = False  # 是否因缺少可靠估值价格而延迟（未落任何快照）
     missing_prices: List[str] = field(default_factory=list)
 
 
@@ -43,6 +44,12 @@ class SettlementEngine:
 
     async def settle(self, trade_date: Optional[str] = None) -> SettlementResult:
         """执行当日结算。
+
+        估值价格按以下顺序解析（缺一档退下一档）：
+        实时/收盘行情 → 当日快照 → 当日日 K 收盘 → （仅当日结算）缓存行情
+        → 早于结算日的最近日 K 收盘（停牌等场景）。
+        全部缺失时结算**延迟**（deferred）：不落净值快照、不把持仓按 0 计入权益，
+        由调度器稍后重试。
 
         Args:
             trade_date: 指定交易日（默认今天）。
@@ -64,6 +71,10 @@ class SettlementEngine:
             )
             return result
 
+        from ..market.history import HistoryService
+
+        history = HistoryService(self._store.conn_provider())
+        settling_today = day >= today_sh().isoformat()
         positions = self._store.get_positions()
         symbols = [item["symbol"] for item in positions]
         quotes_map: Dict[str, Any] = {}
@@ -74,18 +85,13 @@ class SettlementEngine:
         position_rows: List[Dict[str, Any]] = []
         missing_prices: List[str] = []
         for item in positions:
-            quote = quotes_map.get(item["symbol"])
-            if quote is None or quote.last_price <= 0:
-                # 收盘后无行情：退回最近收盘快照
-                fallback = self._store.get_market_snapshot(day, item["symbol"])
-                if fallback is None:
-                    missing_prices.append(item["symbol"])
-                    continue
-                close_price = fallback
-                source = "snapshot"
-            else:
-                close_price = quote.last_price
-                source = quote.source
+            resolved = self._resolve_close(
+                item["symbol"], day, quotes_map.get(item["symbol"]), settling_today, history
+            )
+            if resolved is None:
+                missing_prices.append(item["symbol"])
+                continue
+            close_price, source = resolved
             self._store.save_market_snapshot(day, item["symbol"], close_price, source)
             qty = int(item["qty"])
             value = round(close_price * qty, 2)
@@ -100,14 +106,35 @@ class SettlementEngine:
                     "avg_cost": float(item["avg_cost"]),
                 }
             )
+
+        if missing_prices:
+            # 不能把无价持仓当 0 计入权益：延迟结算，等行情/日 K 可用后由调度器重试
+            logger.warning("结算 %s 缺少可靠估值价格，延迟结算: %s", day, missing_prices)
+            self._store.record_risk_event(
+                "settlement_missing_price",
+                missing_prices[0],
+                f"缺少任何可用价格（行情/快照/日K），延迟结算: {','.join(missing_prices)}",
+                trade_date=day,
+            )
+            return SettlementResult(
+                trade_date=day,
+                cash=self._store.get_cash(),
+                market_value=0.0,
+                total_equity=0.0,
+                deferred=True,
+                missing_prices=missing_prices,
+            )
+
         market_value = round(market_value, 2)
         cash = self._store.get_cash()
         total_equity = round(cash + market_value, 2)
         realized_day = self._store.day_realized_pnl(day)
 
         # 当日盈亏 = 当前权益 - 开盘权益（昨结；首日为初始资金）
-        history = self._store.equity_history(limit=1)
-        day_start_equity = float(history[-1]["total_equity"]) if history else self._store.get_initial_cash()
+        history_rows = self._store.equity_history(limit=1)
+        day_start_equity = (
+            float(history_rows[-1]["total_equity"]) if history_rows else self._store.get_initial_cash()
+        )
         day_pnl = round(total_equity - day_start_equity, 2)
 
         self._store.save_daily_equity(
@@ -118,7 +145,7 @@ class SettlementEngine:
             realized_pnl_day=realized_day,
             positions_json=json.dumps(position_rows, ensure_ascii=False),
         )
-        result = SettlementResult(
+        return SettlementResult(
             trade_date=day,
             cash=cash,
             market_value=market_value,
@@ -128,23 +155,59 @@ class SettlementEngine:
             positions=position_rows,
             missing_prices=missing_prices,
         )
-        if missing_prices:
-            logger.warning("结算缺少行情，未计入市值: %s", missing_prices)
-        return result
+
+    def _resolve_close(
+        self,
+        symbol: str,
+        day: str,
+        quote: Optional[Any],
+        settling_today: bool,
+        history,
+    ) -> Optional[tuple]:
+        """解析某股票在结算日的收盘估值价。
+
+        Returns:
+            (价格, 来源) 或 None（无任何可靠价格）。
+        """
+        if quote is not None and quote.last_price > 0:
+            return float(quote.last_price), str(quote.source)
+        snapshot = self._store.get_market_snapshot(day, symbol)
+        if snapshot is not None and snapshot > 0:
+            return float(snapshot), "snapshot"
+        bars = history.load_cached(symbol, limit=400)
+        same_day = [bar for bar in bars if bar.trade_date == day]
+        if same_day:
+            return float(same_day[-1].close), "daily_bar"
+        if settling_today:
+            cached = self._quotes.peek_cached_price(symbol)
+            if cached is not None and cached > 0:
+                return float(cached), "cache"
+        # 停牌/长期无行情：按最近一根已收盘日 K 估值（并注明来源日期）
+        prior = [bar for bar in bars if bar.trade_date < day]
+        if prior and prior[-1].close > 0:
+            return float(prior[-1].close), f"daily_bar:{prior[-1].trade_date}"
+        return None
 
     def catch_up_settlement(self) -> List[str]:
         """补结算：找出尚未结算且已收盘的历史交易日（重启恢复用）。
+
+        覆盖有成交流水或有收盘快照（说明当日有持仓）但缺净值记录的交易日，
+        包含此前因缺价而延迟、次日日 K 更新后可完成的结算。
 
         Returns:
             List[str]: 待补结算的交易日列表（由调用方逐日执行 settle）。
         """
         pending: List[str] = []
-        history = {row["trade_date"] for row in self._store.equity_history(limit=400)}
-        fills_dates = {
+        settled = {row["trade_date"] for row in self._store.equity_history(limit=400)}
+        activity_dates = {
             row["trade_date"]
             for row in self._connection_execute("SELECT DISTINCT trade_date FROM fills")
         }
-        candidates = fills_dates - history
+        activity_dates |= {
+            row["trade_date"]
+            for row in self._connection_execute("SELECT DISTINCT trade_date FROM market_snapshots")
+        }
+        candidates = activity_dates - settled
         today = today_sh()
         for day in sorted(candidates):
             try:

@@ -238,6 +238,17 @@ _SCHEMA_STATEMENTS = [
         PRIMARY KEY (trade_date, symbol)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS broadcast_deliveries (
+        event_key TEXT NOT NULL,
+        stream_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        detail TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (event_key, stream_id)
+    )
+    """,
 ]
 
 
@@ -1043,13 +1054,22 @@ class AccountStore:
 
     # ── 风控与调度记录 ────────────────────────────────────────
 
-    def record_risk_event(self, rule: str, symbol: Optional[str], detail: str) -> None:
-        """记录风控事件。"""
+    def record_risk_event(
+        self, rule: str, symbol: Optional[str], detail: str, trade_date: Optional[str] = None
+    ) -> None:
+        """记录风控事件。
+
+        Args:
+            rule: 规则/事件名。
+            symbol: 相关股票（可空）。
+            detail: 详情。
+            trade_date: 归属交易日（默认今天；补结算等场景传实际交易日）。
+        """
         conn = self.connection()
         with self._write_lock:
             conn.execute(
                 "INSERT INTO risk_events(trade_date, symbol, rule, detail, created_at) VALUES (?, ?, ?, ?, ?)",
-                (today_sh().isoformat(), symbol, rule, detail, now_sh().isoformat()),
+                (trade_date or today_sh().isoformat(), symbol, rule, detail, now_sh().isoformat()),
             )
             conn.commit()
 
@@ -1104,6 +1124,37 @@ class AccountStore:
             conn.execute(
                 "UPDATE scheduler_runs SET status = ?, finished_at = ?, detail = ? WHERE run_key = ?",
                 (status, now_sh().isoformat(), detail, run_key),
+            )
+            conn.commit()
+
+    def reset_run(self, run_key: str) -> None:
+        """撤销一次未完成的调度运行记录（已完成的除外），允许稍后重试。"""
+        conn = self.connection()
+        with self._write_lock:
+            conn.execute("DELETE FROM scheduler_runs WHERE run_key = ? AND status != 'done'", (run_key,))
+            conn.commit()
+
+    # ── 播报投递记录 ──────────────────────────────────────────
+
+    def get_broadcast_delivery(self, event_key: str, stream_id: str) -> str:
+        """读取某事件在某聊天流的最近投递结果（无记录时为空字符串）。"""
+        row = self.connection().execute(
+            "SELECT outcome FROM broadcast_deliveries WHERE event_key = ? AND stream_id = ?",
+            (event_key, stream_id),
+        ).fetchone()
+        return str(row["outcome"]) if row is not None else ""
+
+    def record_broadcast_delivery(self, event_key: str, stream_id: str, outcome: str, detail: str = "") -> None:
+        """记录一次投递结果（幂等覆盖，累计尝试次数）。"""
+        conn = self.connection()
+        with self._write_lock:
+            conn.execute(
+                "INSERT INTO broadcast_deliveries(event_key, stream_id, outcome, detail, attempts, updated_at) "
+                "VALUES (?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(event_key, stream_id) DO UPDATE SET "
+                "outcome = excluded.outcome, detail = excluded.detail, "
+                "attempts = attempts + 1, updated_at = excluded.updated_at",
+                (event_key, stream_id, outcome, detail, now_sh().isoformat()),
             )
             conn.commit()
 

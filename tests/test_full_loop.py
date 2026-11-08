@@ -156,3 +156,73 @@ class TestFullAutonomousLoop:
         assert fees.stamp_tax_rate == 0.0005
         policy = build_broadcast_policy(config)
         assert policy.enabled and policy.daily_max == 8
+
+
+class TestCandidateIndicatorsInContext:
+    """候选股技术指标必须真正进入给模型的决策材料。"""
+
+    @staticmethod
+    def _bars_with_trend(days: int = 35):
+        from datetime import date, timedelta
+
+        from mai_stock_sim.market.models import DailyBar
+
+        start = date(2026, 9, 27)
+        bars = []
+        for index in range(days):
+            close = 10.0 + index * 0.05
+            # 尾部 5 天成交量放大到 9 倍：avg5/avg20 = 9/((15*1+5*9)/20) = 3.0
+            volume = 9e6 if index >= days - 5 else 1e6
+            bars.append(
+                DailyBar(
+                    "600519", (start + timedelta(days=index)).isoformat(),
+                    close, close * 1.01, close * 0.99, close, volume, 1e8, 0.5,
+                )
+            )
+        return bars
+
+    async def test_context_candidates_include_indicators(self, tmp_path, tmp_store, fake_quotes) -> None:
+        from mai_stock_sim.agent.context import DecisionContextBuilder
+        from mai_stock_sim.agent.stock_selection import CandidatePoolBuilder
+        from mai_stock_sim.agent.strategy_memory import StrategyMemory
+        from mai_stock_sim.market.history import HistoryService
+
+        calendar = FrozenOpenCalendar(tmp_path)
+        tmp_store.replace_stock_pool(
+            [
+                {
+                    "symbol": "600519", "name": "贵州茅台", "board": "SH_MAIN", "last_price": 11.5,
+                    "pct_chg": 1.2, "turnover": 5e8, "market_cap": 5e9, "turnover_rate": 2.0,
+                    "risk_warning": False,
+                }
+            ]
+        )
+        HistoryService(tmp_store.conn_provider()).save_bars(self._bars_with_trend())
+        builder = DecisionContextBuilder(
+            tmp_store, fake_quotes, calendar, StrategyMemory(tmp_store), CandidatePoolBuilder(tmp_store),
+            lambda: RiskParams(),
+        )
+        context = await builder.build("人格", candidates_limit=5)
+        candidates = context["candidates"]
+        assert "600519" in candidates
+        # 趋势、波动率、均线偏离、量比全部进入候选摘要
+        assert "20日+" in candidates
+        assert "波动" in candidates
+        assert "偏离MA20+" in candidates
+        assert "量比3.0" in candidates
+
+    def test_compute_indicators_vol_ratio(self) -> None:
+        from mai_stock_sim.market.history import compute_indicators
+
+        indicators = compute_indicators(self._bars_with_trend())
+        assert indicators["vol_ratio"] == pytest.approx(3.0)
+        # 数据不足时不输出量比（不编造）
+        assert compute_indicators(self._bars_with_trend(days=10)).get("vol_ratio") is None
+
+    def test_indicator_segment_empty_for_short_history(self) -> None:
+        from mai_stock_sim.agent.context import _indicator_segment
+
+        assert _indicator_segment({"count": 0}) == ""
+        assert _indicator_segment({"count": 3}) == ""
+        segment = _indicator_segment({"count": 25, "chg_5d": 2.0, "chg_20d": 5.0, "vol20": 2.0, "ma20": 10.0, "close": 10.5, "position_in_range": 80.0, "vol_ratio": 1.5})
+        assert "5日+2.0%" in segment and "波动2.0%" in segment and "偏离MA20+5.0%" in segment and "量比1.5" in segment
